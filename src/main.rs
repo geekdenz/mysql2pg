@@ -2,9 +2,11 @@ use std::{fs, path::PathBuf};
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
+use dotenvy::dotenv;
 use mysql2pg_middleware::{
     config::AppConfig,
     executor::build_executor,
+    server,
     translator::{translate_sql, TranslationResult},
 };
 use tracing_subscriber::EnvFilter;
@@ -22,6 +24,7 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Commands {
+    Serve,
     Translate {
         #[arg(long)]
         sql: Option<String>,
@@ -42,14 +45,19 @@ enum Commands {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    let _ = dotenv();
+
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::from_default_env())
         .init();
 
     let cli = Cli::parse();
-    let cfg = AppConfig::from_file(&cli.config)?;
+    let cfg = AppConfig::load(&cli.config)?;
 
     match cli.command {
+        Commands::Serve => {
+            server::serve(cfg).await?;
+        }
         Commands::Translate { sql, file, json } => {
             let input = read_input(sql, file)?;
             let result = translate_sql(&input, &cfg.translator)?;
@@ -62,10 +70,13 @@ async fn main() -> Result<()> {
             let query_result = executor.execute_sql(&result.translated_sql).await?;
 
             if json {
-                println!("{}", serde_json::to_string_pretty(&serde_json::json!({
-                    "translation": result,
-                    "execution": query_result,
-                }))?);
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "translation": result,
+                        "execution": query_result,
+                    }))?
+                );
             } else {
                 print_translation(&result, false);
                 println!("\nExecution result:");

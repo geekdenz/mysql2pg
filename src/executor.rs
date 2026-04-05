@@ -105,14 +105,29 @@ fn value_to_string(row: &tokio_postgres::Row, idx: usize, ty: &Type) -> String {
         Type::FLOAT4 => row.try_get::<usize, Option<f32>>(idx).ok().flatten().map(|v| v.to_string()).unwrap_or_default(),
         Type::FLOAT8 => row.try_get::<usize, Option<f64>>(idx).ok().flatten().map(|v| v.to_string()).unwrap_or_default(),
         Type::TEXT | Type::VARCHAR | Type::BPCHAR | Type::NAME => row.try_get::<usize, Option<String>>(idx).ok().flatten().unwrap_or_default(),
-        Type::JSON | Type::JSONB => row.try_get::<usize, Option<serde_json::Value>>(idx).ok().flatten().map(|v| v.to_string()).unwrap_or_default(),
-        _ => row.try_get::<usize, Option<String>>(idx).ok().flatten().unwrap_or_else(|| "<unrendered>".to_string()),
+        Type::JSON | Type::JSONB => row
+            .try_get::<usize, Option<serde_json::Value>>(idx)
+            .ok()
+            .flatten()
+            .map(|v| v.to_string())
+            .unwrap_or_default(),
+        Type::BYTEA => row
+            .try_get::<usize, Option<Vec<u8>>>(idx)
+            .ok()
+            .flatten()
+            .map(|bytes| format!("\x{}", bytes.iter().map(|b| format!("{:02x}", b)).collect::<String>()))
+            .unwrap_or_default(),
+        _ => row
+            .try_get::<usize, Option<String>>(idx)
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| "<unrendered>".to_string()),
     }
 }
 
-pub fn build_executor(cfg: &AppConfig) -> Result<Box<dyn PostgresExecutor>, MiddlewareError> {
+pub fn build_executor(cfg: &AppConfig) -> Result<std::sync::Arc<dyn PostgresExecutor>, MiddlewareError> {
     match cfg.postgres.driver.as_str() {
-        "tokio-postgres" => Ok(Box::new(TokioPostgresExecutor::new(
+        "tokio-postgres" => Ok(std::sync::Arc::new(TokioPostgresExecutor::new(
             cfg.postgres.connection_string.clone(),
         ))),
         other => Err(MiddlewareError::Config(format!(

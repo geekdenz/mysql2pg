@@ -1,0 +1,43 @@
+services:
+  middleware:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    env_file:
+      - .env
+    environment:
+      MW_SERVER_BIND_ADDR: ${MW_SERVER_BIND_ADDR:-0.0.0.0:8080}
+      MW_POSTGRES_DRIVER: ${MW_POSTGRES_DRIVER:-tokio-postgres}
+      MW_POSTGRES_CONNECTION_STRING: ${MW_POSTGRES_CONNECTION_STRING:-host=postgres port=5432 user=postgres password=postgres dbname=app}
+      MW_TRANSLATOR_REWRITE_LIMIT_COMMA: ${MW_TRANSLATOR_REWRITE_LIMIT_COMMA:-true}
+      MW_TRANSLATOR_NORMALIZE_MYSQL_BACKTICKS: ${MW_TRANSLATOR_NORMALIZE_MYSQL_BACKTICKS:-true}
+      MW_TRANSLATOR_NORMALIZE_BOOLEAN_LITERALS: ${MW_TRANSLATOR_NORMALIZE_BOOLEAN_LITERALS:-true}
+      MW_TRANSLATOR_REWRITE_MYSQL_FUNCTIONS: ${MW_TRANSLATOR_REWRITE_MYSQL_FUNCTIONS:-true}
+      MW_TRANSLATOR_REWRITE_JSON_OPERATORS: ${MW_TRANSLATOR_REWRITE_JSON_OPERATORS:-true}
+      MW_TRANSLATOR_STRIP_MYSQL_TABLE_OPTIONS: ${MW_TRANSLATOR_STRIP_MYSQL_TABLE_OPTIONS:-true}
+      RUST_LOG: ${RUST_LOG:-info}
+    ports:
+      - "${MIDDLEWARE_PORT:-8080}:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    command: ["mysql2pg-middleware", "--config", "/app/config/example.toml", "serve"]
+
+  postgres:
+    image: postgres:17
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-app}
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres} -d ${POSTGRES_DB:-app}"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
+volumes:
+  postgres_data:
