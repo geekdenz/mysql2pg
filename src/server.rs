@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 use crate::{
     config::AppConfig,
     executor::{build_executor, PostgresExecutor, QueryResult},
+    mysql_server::{serve_mysql, MySqlFrontendFactory},
     translator::{translate_sql, TranslationResult},
 };
 
@@ -29,6 +30,8 @@ pub struct SqlRequest {
 #[derive(Debug, Serialize)]
 pub struct HealthResponse {
     pub status: &'static str,
+    pub http_bind_addr: String,
+    pub mysql_bind_addr: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -43,26 +46,48 @@ pub struct ErrorResponse {
 }
 
 pub async fn serve(config: AppConfig) -> anyhow::Result<()> {
-    let bind_addr = config.server.bind_addr.clone();
-    let state = AppState {
-        executor: build_executor(&config)?,
-        config: Arc::new(config),
+    let http_bind_addr = config.server.bind_addr.clone();
+    let mysql_bind_addr = config.server.mysql_bind_addr.clone();
+    let shared_config = Arc::new(config);
+    let executor = build_executor(shared_config.as_ref())?;
+
+    let http_state = AppState {
+        executor: executor.clone(),
+        config: shared_config.clone(),
     };
 
     let app = Router::new()
         .route("/health", get(health))
         .route("/translate", post(translate))
         .route("/execute", post(execute))
-        .with_state(state);
+        .with_state(http_state);
 
-    let listener = tokio::net::TcpListener::bind(&bind_addr).await?;
-    tracing::info!("mysql2pg-middleware listening on {}", bind_addr);
-    axum::serve(listener, app).await?;
+    let http_listener = tokio::net::TcpListener::bind(&http_bind_addr).await?;
+    let mysql_factory = MySqlFrontendFactory::new(shared_config.clone(), executor);
+
+    tracing::info!("http frontend listening on {}", http_bind_addr);
+    tracing::info!("mysql-compatible frontend listening on {}", mysql_bind_addr);
+
+    let http_task = async move {
+        axum::serve(http_listener, app).await?;
+        Ok::<(), anyhow::Error>(())
+    };
+
+    let mysql_task = async move {
+        serve_mysql(mysql_factory, mysql_bind_addr).await?;
+        Ok::<(), anyhow::Error>(())
+    };
+
+    let (_http_result, _mysql_result) = tokio::try_join!(http_task, mysql_task)?;
     Ok(())
 }
 
-async fn health() -> impl IntoResponse {
-    Json(HealthResponse { status: "ok" })
+async fn health(State(state): State<AppState>) -> impl IntoResponse {
+    Json(HealthResponse {
+        status: "ok",
+        http_bind_addr: state.config.server.bind_addr.clone(),
+        mysql_bind_addr: state.config.server.mysql_bind_addr.clone(),
+    })
 }
 
 async fn translate(
