@@ -113,6 +113,32 @@ If you want to avoid colliding with a local MySQL server, set:
 MYSQL_FRONTEND_PORT=3307
 ```
 
+### Run Matomo against the middleware
+
+The compose file includes an optional `matomo` service pinned to the latest stable Matomo release verified for this repository: `5.8.0-apache`.
+
+Start it with:
+
+```bash
+docker compose --profile matomo up --build -d
+```
+
+Then open:
+
+```text
+http://127.0.0.1:8081
+```
+
+The Matomo container is configured to use the middleware's MySQL-compatible frontend:
+
+- host: `middleware`
+- adapter: `MYSQLI`
+- database: `app`
+- username: `anyuser`
+- password: `matomo`
+
+The real storage remains PostgreSQL behind the middleware.
+
 ### Load the compatibility fixture
 
 The repository includes a broader integration fixture:
@@ -139,6 +165,7 @@ That fixture exercises:
 - PostgreSQL execution errors now include the underlying message and available detail/hint/schema/table/column/constraint fields.
 - Complex `CREATE TABLE` statements are translated through the parsed MySQL AST into PostgreSQL-native DDL.
 - MySQL metadata statements are translated into PostgreSQL catalog queries instead of being passed through verbatim.
+- An optional Docker Compose Matomo service is available for end-to-end compatibility testing against a real MySQL-native application.
 
 ## Sharing a zip for iteration
 

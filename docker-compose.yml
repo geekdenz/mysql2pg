@@ -41,5 +41,25 @@ services:
     volumes:
       - postgres_data:/var/lib/postgresql/data
 
+  matomo:
+    image: matomo:${MATOMO_IMAGE_TAG:-5.8.0-apache}
+    profiles: ["matomo"]
+    environment:
+      MATOMO_DATABASE_HOST: ${MATOMO_DATABASE_HOST:-middleware}
+      MATOMO_DATABASE_ADAPTER: ${MATOMO_DATABASE_ADAPTER:-MYSQLI}
+      MATOMO_DATABASE_TABLES_PREFIX: ${MATOMO_DATABASE_TABLES_PREFIX:-matomo_}
+      MATOMO_DATABASE_USERNAME: ${MATOMO_DATABASE_USERNAME:-anyuser}
+      MATOMO_DATABASE_PASSWORD: ${MATOMO_DATABASE_PASSWORD:-matomo}
+      MATOMO_DATABASE_DBNAME: ${MATOMO_DATABASE_DBNAME:-app}
+      PHP_MEMORY_LIMIT: ${MATOMO_PHP_MEMORY_LIMIT:-512M}
+    ports:
+      - "${MATOMO_PORT:-8081}:80"
+    depends_on:
+      middleware:
+        condition: service_started
+    volumes:
+      - matomo_data:/var/www/html
+
 volumes:
   postgres_data:
+  matomo_data:

@@ -3,6 +3,7 @@ WORKDIR /app
 
 COPY Cargo.toml ./
 COPY Cargo.lock ./
+COPY vendor ./vendor
 COPY src ./src
 COPY config ./config
 

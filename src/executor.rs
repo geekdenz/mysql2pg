@@ -14,6 +14,7 @@ pub struct QueryResult {
 #[async_trait]
 pub trait PostgresExecutor: Send + Sync {
     async fn execute_sql(&self, sql: &str) -> Result<QueryResult, MiddlewareError>;
+    async fn describe_sql(&self, sql: &str) -> Result<Vec<String>, MiddlewareError>;
 }
 
 pub struct TokioPostgresExecutor {
@@ -46,10 +47,17 @@ impl PostgresExecutor for TokioPostgresExecutor {
             || sql_upper.starts_with("VALUES");
 
         if !returns_rows {
-            let affected = client
-                .execute(sql, &[])
+            let messages = client
+                .simple_query(sql)
                 .await
                 .map_err(|e| MiddlewareError::Execution(format!("statement failed: {}", format_pg_error(&e))))?;
+            let affected = messages
+                .into_iter()
+                .filter_map(|message| match message {
+                    SimpleQueryMessage::CommandComplete(rows) => Some(rows),
+                    _ => None,
+                })
+                .sum();
             return Ok(QueryResult {
                 columns: vec![],
                 rows: vec![],
@@ -92,6 +100,37 @@ impl PostgresExecutor for TokioPostgresExecutor {
             rows: rendered_rows,
             row_count,
         })
+    }
+
+    async fn describe_sql(&self, sql: &str) -> Result<Vec<String>, MiddlewareError> {
+        let (client, connection) = tokio_postgres::connect(&self.connection_string, NoTls)
+            .await
+            .map_err(|e| MiddlewareError::Execution(format!("failed to connect to PostgreSQL: {}", format_pg_error(&e))))?;
+
+        tokio::spawn(async move {
+            if let Err(err) = connection.await {
+                eprintln!("postgres connection error: {err}");
+            }
+        });
+
+        let messages = client
+            .simple_query(sql)
+            .await
+            .map_err(|e| MiddlewareError::Execution(format!("query description failed: {}", format_pg_error(&e))))?;
+
+        for message in messages {
+            match message {
+                SimpleQueryMessage::RowDescription(description) => {
+                    return Ok(description.iter().map(|column| column.name().to_string()).collect())
+                }
+                SimpleQueryMessage::Row(row) => {
+                    return Ok(row.columns().iter().map(|column| column.name().to_string()).collect())
+                }
+                _ => {}
+            }
+        }
+
+        Ok(Vec::new())
     }
 }
 

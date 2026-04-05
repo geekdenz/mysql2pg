@@ -5,6 +5,7 @@ use sqlparser::ast::{
     ShowCreateObject, ShowStatementFilter, ShowStatementFilterPosition, ShowStatementInParentType,
     ShowStatementOptions, Statement, TableConstraint, TimezoneInfo,
 };
+use sqlparser::ast::table_constraints::IndexConstraint;
 
 use crate::{config::TranslatorConfig, error::MiddlewareError, parser::parse_mysql_sql};
 
@@ -697,7 +698,7 @@ fn translate_create_table(
     create: &CreateTable,
     warnings: &mut Vec<String>,
 ) -> Result<String, MiddlewareError> {
-    if create.or_replace || create.temporary || create.external || create.dynamic || create.global.is_some()
+    if create.or_replace || create.external || create.dynamic || create.global.is_some()
         || create.transient || create.volatile || create.iceberg || create.query.is_some()
         || create.without_rowid || create.like.is_some() || create.clone.is_some()
         || create.version.is_some() || create.comment.is_some() || create.on_commit.is_some()
@@ -720,6 +721,7 @@ fn translate_create_table(
 
     let mut rendered_items = Vec::new();
     let mut extra_constraints = Vec::new();
+    let mut post_statements = Vec::new();
 
     for column in &create.columns {
         let (rendered, constraints) = translate_column(column, warnings)?;
@@ -728,7 +730,16 @@ fn translate_create_table(
     }
 
     for constraint in &create.constraints {
-        rendered_items.push(translate_table_constraint(constraint)?);
+        match constraint {
+            TableConstraint::Index(index) => {
+                post_statements.push(translate_inline_index(index, &create.name)?);
+                warnings.push(format!(
+                    "rewrote MySQL inline KEY/INDEX `{}` to a separate PostgreSQL CREATE INDEX statement",
+                    index.name.as_ref().map(|n| n.to_string()).unwrap_or_else(|| "<unnamed>".to_string())
+                ));
+            }
+            _ => rendered_items.push(translate_table_constraint(constraint)?),
+        }
     }
     rendered_items.extend(extra_constraints);
 
@@ -736,12 +747,21 @@ fn translate_create_table(
         warnings.push("stripped MySQL-specific CREATE TABLE options".to_string());
     }
 
+    let temporary = if create.temporary { "TEMPORARY " } else { "" };
     let if_not_exists = if create.if_not_exists { "IF NOT EXISTS " } else { "" };
-    Ok(format!(
-        "CREATE TABLE {if_not_exists}{} ({})",
+    let create_table_sql = format!(
+        "CREATE {temporary}TABLE {if_not_exists}{} ({})",
         create.name,
         rendered_items.join(", ")
-    ))
+    );
+
+    if post_statements.is_empty() {
+        Ok(create_table_sql)
+    } else {
+        let mut statements = vec![create_table_sql];
+        statements.extend(post_statements);
+        Ok(statements.join("; "))
+    }
 }
 
 fn translate_table_constraint(constraint: &TableConstraint) -> Result<String, MiddlewareError> {
@@ -831,15 +851,72 @@ fn translate_table_constraint(constraint: &TableConstraint) -> Result<String, Mi
                 .unwrap_or_default();
             Ok(format!("{name}CHECK ({})", check.expr))
         }
-        TableConstraint::Index(index) => Err(MiddlewareError::Translation(format!(
-            "MySQL KEY/INDEX constraint `{}` inside CREATE TABLE is not translated yet; create the index separately in PostgreSQL",
-            index.name.as_ref().map(|n| n.to_string()).unwrap_or_else(|| "<unnamed>".to_string())
-        ))),
+        TableConstraint::Index(_) => Err(MiddlewareError::Translation(
+            "MySQL KEY/INDEX constraint should be handled before table constraint rendering".to_string(),
+        )),
         TableConstraint::FulltextOrSpatial(index) => Err(MiddlewareError::Translation(format!(
             "MySQL FULLTEXT/SPATIAL constraint `{}` is not supported in PostgreSQL translation",
             index.opt_index_name.as_ref().map(|n| n.to_string()).unwrap_or_else(|| "<unnamed>".to_string())
         ))),
     }
+}
+
+fn translate_inline_index(index: &IndexConstraint, table_name: &ObjectName) -> Result<String, MiddlewareError> {
+    if !index.index_options.is_empty() {
+        return Err(MiddlewareError::Translation(format!(
+            "MySQL inline KEY/INDEX `{}` with index options is not supported yet",
+            index.name.as_ref().map(|n| n.to_string()).unwrap_or_else(|| "<unnamed>".to_string())
+        )));
+    }
+
+    if let Some(index_type) = &index.index_type {
+        return Err(MiddlewareError::Translation(format!(
+            "MySQL inline KEY/INDEX `{}` USING {index_type} is not supported yet",
+            index.name.as_ref().map(|n| n.to_string()).unwrap_or_else(|| "<unnamed>".to_string())
+        )));
+    }
+
+    let table_index_prefix = sanitize_identifier_for_index_name(&object_name_tail(table_name));
+    let index_name = index
+        .name
+        .as_ref()
+        .map(ToString::to_string)
+        .map(|name| {
+            let sanitized = sanitize_identifier_for_index_name(&name);
+            if sanitized.starts_with(&format!("{table_index_prefix}_")) {
+                sanitized
+            } else {
+                format!("{table_index_prefix}_{sanitized}")
+            }
+        })
+        .unwrap_or_else(|| format!("{table_index_prefix}_idx"));
+    let columns = index
+        .columns
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    Ok(format!("CREATE INDEX {index_name} ON {table_name} ({columns})"))
+}
+
+fn object_name_tail(name: &ObjectName) -> String {
+    name.0
+        .last()
+        .map(ToString::to_string)
+        .unwrap_or_else(|| name.to_string())
+}
+
+fn sanitize_identifier_for_index_name(name: &str) -> String {
+    let mut out = String::with_capacity(name.len());
+    for ch in name.chars() {
+        if ch.is_ascii_alphanumeric() || ch == '_' {
+            out.push(ch.to_ascii_lowercase());
+        } else {
+            out.push('_');
+        }
+    }
+    out.trim_matches('_').to_string()
 }
 
 fn translate_column(column: &ColumnDef, warnings: &mut Vec<String>) -> Result<(String, Vec<String>), MiddlewareError> {
@@ -1154,6 +1231,7 @@ fn rewrite_mysql_functions(sql: &str, warnings: &mut Vec<String>) -> String {
         (r"(?i)\bIFNULL\s*\(", "COALESCE("),
         (r"(?i)\bNOW\s*\(", "CURRENT_TIMESTAMP("),
         (r"(?i)\bRAND\s*\(", "RANDOM("),
+        (r"(?i)\bDATABASE\s*\(", "CURRENT_DATABASE("),
     ];
 
     for (pattern, replacement) in replacements {
@@ -1246,13 +1324,14 @@ mod tests {
     #[test]
     fn rewrites_common_functions() {
         let result = translate_sql(
-            "SELECT IFNULL(name, 'x'), FROM_UNIXTIME(created_at), UNIX_TIMESTAMP(updated_at), RAND() FROM users",
+            "SELECT IFNULL(name, 'x'), FROM_UNIXTIME(created_at), UNIX_TIMESTAMP(updated_at), RAND(), DATABASE() FROM users",
             &TranslatorConfig::default(),
         ).unwrap();
         assert!(result.translated_sql.contains("COALESCE(name, 'x')"));
         assert!(result.translated_sql.contains("TO_TIMESTAMP(created_at)"));
         assert!(result.translated_sql.contains("EXTRACT(EPOCH FROM updated_at)"));
         assert!(result.translated_sql.contains("RANDOM()"));
+        assert!(result.translated_sql.contains("CURRENT_DATABASE()"));
     }
 
     #[test]
