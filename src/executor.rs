@@ -57,24 +57,21 @@ impl PostgresExecutor for TokioPostgresExecutor {
             });
         }
 
-        let rows = client
-            .query(sql, &[])
+        let statement = client
+            .prepare(sql)
             .await
-            .map_err(|e| MiddlewareError::Execution(format!("query failed: {e}")))?;
+            .map_err(|e| MiddlewareError::Execution(format!("failed to prepare translated query: {e}")))?;
 
-        if rows.is_empty() {
-            return Ok(QueryResult {
-                columns: vec![],
-                rows: vec![],
-                row_count: 0,
-            });
-        }
-
-        let columns = rows[0]
+        let columns = statement
             .columns()
             .iter()
             .map(|c| c.name().to_string())
             .collect::<Vec<_>>();
+
+        let rows = client
+            .query(&statement, &[])
+            .await
+            .map_err(|e| MiddlewareError::Execution(format!("query failed: {e}")))?;
 
         let row_count = rows.len() as u64;
         let rendered_rows = rows

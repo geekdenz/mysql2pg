@@ -70,10 +70,63 @@ fn rewrite_limit_offset_count(sql: &str, warnings: &mut Vec<String>) -> String {
 }
 
 fn rewrite_boolean_literals(sql: &str) -> String {
-    let true_re = Regex::new(r"(?i)(?<![A-Za-z0-9_])true(?![A-Za-z0-9_])").expect("valid regex");
-    let false_re = Regex::new(r"(?i)(?<![A-Za-z0-9_])false(?![A-Za-z0-9_])").expect("valid regex");
-    let tmp = true_re.replace_all(sql, "TRUE").to_string();
-    false_re.replace_all(&tmp, "FALSE").to_string()
+    let mut out = String::with_capacity(sql.len());
+    let chars: Vec<char> = sql.chars().collect();
+    let mut idx = 0;
+    let mut quote: Option<char> = None;
+
+    while idx < chars.len() {
+        let ch = chars[idx];
+
+        if let Some(active_quote) = quote {
+            out.push(ch);
+            idx += 1;
+
+            if ch == active_quote {
+                if idx < chars.len() && chars[idx] == active_quote {
+                    out.push(chars[idx]);
+                    idx += 1;
+                } else {
+                    quote = None;
+                }
+            }
+            continue;
+        }
+
+        if matches!(ch, '\'' | '"' | '`') {
+            quote = Some(ch);
+            out.push(ch);
+            idx += 1;
+            continue;
+        }
+
+        if is_identifier_char(ch) {
+            let start = idx;
+            idx += 1;
+            while idx < chars.len() && is_identifier_char(chars[idx]) {
+                idx += 1;
+            }
+
+            let token = chars[start..idx].iter().collect::<String>();
+            if token.eq_ignore_ascii_case("true") {
+                out.push_str("TRUE");
+            } else if token.eq_ignore_ascii_case("false") {
+                out.push_str("FALSE");
+            } else {
+                out.push_str(&token);
+            }
+            continue;
+        }
+
+        out.push(ch);
+        idx += 1;
+    }
+
+    out
+}
+
+fn is_identifier_char(ch: char) -> bool {
+    ch.is_ascii_alphanumeric() || ch == '_'
 }
 
 fn rewrite_mysql_functions(sql: &str, warnings: &mut Vec<String>) -> String {
@@ -182,5 +235,17 @@ mod tests {
         assert!(result.translated_sql.contains("TO_TIMESTAMP(created_at)"));
         assert!(result.translated_sql.contains("EXTRACT(EPOCH FROM updated_at)"));
         assert!(result.translated_sql.contains("RANDOM()"));
+    }
+
+    #[test]
+    fn leaves_string_literals_unchanged_when_normalizing_booleans() {
+        let result = translate_sql("SELECT true, false, 'true', \"false_value\" FROM flags", &TranslatorConfig::default()).unwrap();
+        assert!(result.translated_sql.contains("SELECT TRUE, FALSE, 'true', \"false_value\" FROM flags"));
+    }
+
+    #[test]
+    fn simple_select_does_not_panic_during_boolean_normalization() {
+        let result = translate_sql("select 1", &TranslatorConfig::default()).unwrap();
+        assert_eq!(result.translated_sql, "SELECT 1");
     }
 }

@@ -2,8 +2,8 @@ use std::{collections::HashMap, io, sync::Arc};
 
 use async_trait::async_trait;
 use opensrv_mysql::{
-    AsyncMysqlIntermediary, AsyncMysqlShim, Column, ColumnFlags, ColumnType, ErrorKind, IntermediaryOptions,
-    OkResponse, ParamParser, QueryResultWriter, StatementMetaWriter,
+    AsyncMysqlIntermediary, AsyncMysqlShim, Column, ColumnFlags, ColumnType, ErrorKind, InitWriter,
+    IntermediaryOptions, OkResponse, ParamParser, QueryResultWriter, StatementMetaWriter,
 };
 use tokio::{io::split, net::TcpListener};
 
@@ -60,6 +60,7 @@ impl MySqlFrontendFactory {
             executor: self.executor.clone(),
             next_statement_id: 1,
             prepared: HashMap::new(),
+            current_db: None,
         }
     }
 }
@@ -99,6 +100,7 @@ struct MySqlBackend {
     executor: Arc<dyn PostgresExecutor>,
     next_statement_id: u32,
     prepared: HashMap<u32, PreparedStatement>,
+    current_db: Option<String>,
 }
 
 #[async_trait]
@@ -110,6 +112,22 @@ where
 
     fn version(&self) -> String {
         "8.0.0-mysql2pg".to_string()
+    }
+
+
+
+    async fn on_init<'a>(
+        &'a mut self,
+        schema: &'a str,
+        writer: InitWriter<'a, W>,
+    ) -> Result<(), Self::Error> {
+        self.current_db = if schema.trim().is_empty() {
+            None
+        } else {
+            Some(schema.trim().to_string())
+        };
+        writer.ok().await?;
+        Ok(())
     }
 
     async fn on_prepare<'a>(
@@ -127,7 +145,13 @@ where
             return Ok(());
         }
 
-        let translated = translate_sql(query, &self.config.translator)?.translated_sql;
+        let translated = match translate_sql(query, &self.config.translator) {
+            Ok(result) => result.translated_sql,
+            Err(err) => {
+                info.error(ErrorKind::ER_PARSE_ERROR, err.to_string().as_bytes()).await?;
+                return Ok(());
+            }
+        };
         let statement_id = self.next_statement_id;
         self.next_statement_id += 1;
         self.prepared.insert(statement_id, PreparedStatement { translated_sql: translated });
@@ -151,8 +175,14 @@ where
             return Ok(());
         };
 
-        let query_result = self.executor.execute_sql(&statement.translated_sql).await?;
-        write_query_result(results, query_result).await
+        match self.executor.execute_sql(&statement.translated_sql).await {
+            Ok(query_result) => write_query_result(results, query_result).await,
+            Err(err) => {
+                let msg = err.to_string();
+                results.error(ErrorKind::ER_UNKNOWN_ERROR, msg.as_bytes()).await?;
+                Ok(())
+            }
+        }
     }
 
     async fn on_close<'a>(&'a mut self, stmt: u32)
@@ -177,9 +207,23 @@ where
             return Ok(());
         }
 
-        let translated = translate_sql(trimmed, &self.config.translator)?.translated_sql;
-        let query_result = self.executor.execute_sql(&translated).await?;
-        write_query_result(results, query_result).await
+        let translated = match translate_sql(trimmed, &self.config.translator) {
+            Ok(result) => result.translated_sql,
+            Err(err) => {
+                let msg = err.to_string();
+                results.error(ErrorKind::ER_PARSE_ERROR, msg.as_bytes()).await?;
+                return Ok(());
+            }
+        };
+
+        match self.executor.execute_sql(&translated).await {
+            Ok(query_result) => write_query_result(results, query_result).await,
+            Err(err) => {
+                let msg = err.to_string();
+                results.error(ErrorKind::ER_UNKNOWN_ERROR, msg.as_bytes()).await?;
+                Ok(())
+            }
+        }
     }
 }
 

@@ -1,6 +1,6 @@
 [package]
 name = "mysql2pg-middleware"
-version = "0.3.0"
+version = "0.3.2"
 edition = "2021"
 description = "A Rust middleware that parses MySQL SQL, translates it to PostgreSQL SQL, and can expose a MySQL-compatible server front end."
 license = "MIT"
