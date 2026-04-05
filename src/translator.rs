@@ -1,6 +1,10 @@
 use regex::{Captures, Regex};
 use serde::Serialize;
-use sqlparser::ast::{ColumnDef, ColumnOption, CreateTable, DataType, ExactNumberInfo, Statement, TimezoneInfo};
+use sqlparser::ast::{
+    ColumnDef, ColumnOption, CreateTable, DataType, ExactNumberInfo, ShowStatementFilter,
+    ShowStatementFilterPosition, ShowStatementInParentType, ShowStatementOptions, Statement,
+    TableConstraint, TimezoneInfo,
+};
 
 use crate::{config::TranslatorConfig, error::MiddlewareError, parser::parse_mysql_sql};
 
@@ -74,7 +78,120 @@ fn translate_statements(
 fn translate_statement(stmt: &Statement, warnings: &mut Vec<String>) -> Result<String, MiddlewareError> {
     match stmt {
         Statement::CreateTable(create) => translate_create_table(create, warnings),
+        Statement::ShowTables {
+            terse,
+            history,
+            extended,
+            full,
+            external,
+            show_options,
+        } => translate_show_tables(
+            *terse,
+            *history,
+            *extended,
+            *full,
+            *external,
+            show_options,
+            warnings,
+        ),
         _ => Ok(stmt.to_string()),
+    }
+}
+
+fn translate_show_tables(
+    terse: bool,
+    history: bool,
+    extended: bool,
+    full: bool,
+    external: bool,
+    show_options: &ShowStatementOptions,
+    warnings: &mut Vec<String>,
+) -> Result<String, MiddlewareError> {
+    if terse || history || extended || external {
+        return Err(MiddlewareError::Translation(
+            "SHOW TABLES options TERSE/HISTORY/EXTENDED/EXTERNAL are not supported yet".to_string(),
+        ));
+    }
+
+    if show_options.starts_with.is_some() || show_options.limit.is_some() || show_options.limit_from.is_some() {
+        return Err(MiddlewareError::Translation(
+            "SHOW TABLES STARTS WITH/LIMIT options are not supported yet".to_string(),
+        ));
+    }
+
+    let (schema_expr, column_alias) = resolve_show_tables_schema(show_options)?;
+    let object_type_expr = if full {
+        "CASE WHEN table_type = 'VIEW' THEN 'VIEW' ELSE 'BASE TABLE' END AS \"Table_type\""
+    } else {
+        ""
+    };
+
+    let mut sql = format!(
+        "SELECT table_name AS \"{column_alias}\"{} FROM information_schema.tables WHERE table_schema = {schema_expr} AND table_type IN ('BASE TABLE', 'VIEW')",
+        if full { format!(", {object_type_expr}") } else { String::new() }
+    );
+
+    if let Some(filter_sql) = translate_show_tables_filter(show_options)? {
+        sql.push_str(" AND ");
+        sql.push_str(&filter_sql);
+    }
+
+    sql.push_str(" ORDER BY table_name");
+    warnings.push("rewrote MySQL SHOW TABLES to information_schema query".to_string());
+    Ok(sql)
+}
+
+fn resolve_show_tables_schema(show_options: &ShowStatementOptions) -> Result<(String, String), MiddlewareError> {
+    let Some(show_in) = &show_options.show_in else {
+        return Ok((
+            "current_schema()".to_string(),
+            "Tables_in_current_schema".to_string(),
+        ));
+    };
+
+    match &show_in.parent_type {
+        None | Some(ShowStatementInParentType::Schema) | Some(ShowStatementInParentType::Database) => {
+            if show_in.parent_name.is_some() {
+                let alias_name = show_in.parent_name.as_ref().unwrap().to_string();
+                Ok((
+                    format!("'{}'", alias_name.replace('\'', "''")),
+                    format!("Tables_in_{alias_name}"),
+                ))
+            } else {
+                Ok((
+                    "current_schema()".to_string(),
+                    "Tables_in_current_schema".to_string(),
+                ))
+            }
+        }
+        Some(other) => Err(MiddlewareError::Translation(format!(
+            "SHOW TABLES {} is not supported yet",
+            other
+        ))),
+    }
+}
+
+fn translate_show_tables_filter(
+    show_options: &ShowStatementOptions,
+) -> Result<Option<String>, MiddlewareError> {
+    let Some(filter_position) = &show_options.filter_position else {
+        return Ok(None);
+    };
+
+    let filter = match filter_position {
+        ShowStatementFilterPosition::Infix(filter) | ShowStatementFilterPosition::Suffix(filter) => filter,
+    };
+
+    match filter {
+        ShowStatementFilter::Like(pattern)
+        | ShowStatementFilter::ILike(pattern)
+        | ShowStatementFilter::NoKeyword(pattern) => Ok(Some(format!(
+            "table_name LIKE '{}'",
+            pattern.replace('\'', "''")
+        ))),
+        ShowStatementFilter::Where(_) => Err(MiddlewareError::Translation(
+            "SHOW TABLES ... WHERE is not supported yet".to_string(),
+        )),
     }
 }
 
@@ -113,7 +230,7 @@ fn translate_create_table(
     }
 
     for constraint in &create.constraints {
-        rendered_items.push(constraint.to_string());
+        rendered_items.push(translate_table_constraint(constraint)?);
     }
     rendered_items.extend(extra_constraints);
 
@@ -127,6 +244,104 @@ fn translate_create_table(
         create.name,
         rendered_items.join(", ")
     ))
+}
+
+fn translate_table_constraint(constraint: &TableConstraint) -> Result<String, MiddlewareError> {
+    match constraint {
+        TableConstraint::Unique(unique) => {
+            let name = unique
+                .name
+                .as_ref()
+                .map(|name| format!("CONSTRAINT {name} "))
+                .unwrap_or_default();
+            let columns = unique.columns.iter().map(ToString::to_string).collect::<Vec<_>>().join(", ");
+            let nulls_distinct = unique.nulls_distinct.to_string();
+            let characteristics = unique
+                .characteristics
+                .as_ref()
+                .map(|value| format!(" {value}"))
+                .unwrap_or_default();
+            Ok(format!("{name}UNIQUE{nulls_distinct} ({columns}){characteristics}"))
+        }
+        TableConstraint::PrimaryKey(primary_key) => {
+            let name = primary_key
+                .name
+                .as_ref()
+                .map(|name| format!("CONSTRAINT {name} "))
+                .unwrap_or_default();
+            let columns = primary_key
+                .columns
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(", ");
+            let characteristics = primary_key
+                .characteristics
+                .as_ref()
+                .map(|value| format!(" {value}"))
+                .unwrap_or_default();
+            Ok(format!("{name}PRIMARY KEY ({columns}){characteristics}"))
+        }
+        TableConstraint::ForeignKey(foreign_key) => {
+            let name = foreign_key
+                .name
+                .as_ref()
+                .map(|name| format!("CONSTRAINT {name} "))
+                .unwrap_or_default();
+            let columns = foreign_key
+                .columns
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(", ");
+            let referred_columns = foreign_key
+                .referred_columns
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(", ");
+            let match_kind = foreign_key
+                .match_kind
+                .as_ref()
+                .map(|value| format!(" {value}"))
+                .unwrap_or_default();
+            let on_delete = foreign_key
+                .on_delete
+                .as_ref()
+                .map(|value| format!(" ON DELETE {value}"))
+                .unwrap_or_default();
+            let on_update = foreign_key
+                .on_update
+                .as_ref()
+                .map(|value| format!(" ON UPDATE {value}"))
+                .unwrap_or_default();
+            let characteristics = foreign_key
+                .characteristics
+                .as_ref()
+                .map(|value| format!(" {value}"))
+                .unwrap_or_default();
+            Ok(format!(
+                "{name}FOREIGN KEY ({columns}) REFERENCES {} ({referred_columns}){match_kind}{on_delete}{on_update}{characteristics}",
+                foreign_key.foreign_table
+            ))
+        }
+        TableConstraint::Check(check) => {
+            let name = check
+                .name
+                .as_ref()
+                .map(|name| format!("CONSTRAINT {name} "))
+                .unwrap_or_default();
+            Ok(format!("{name}CHECK ({})", check.expr))
+        }
+        TableConstraint::Index(index) => Err(MiddlewareError::Translation(format!(
+            "MySQL KEY/INDEX constraint `{}` inside CREATE TABLE is not translated yet; create the index separately in PostgreSQL",
+            index.name.as_ref().map(|n| n.to_string()).unwrap_or_else(|| "<unnamed>".to_string())
+        ))),
+        TableConstraint::FulltextOrSpatial(index) => Err(MiddlewareError::Translation(format!(
+            "MySQL FULLTEXT/SPATIAL constraint `{}` is not supported in PostgreSQL translation",
+            index.opt_index_name.as_ref().map(|n| n.to_string()).unwrap_or_else(|| "<unnamed>".to_string())
+        ))),
+    }
 }
 
 fn translate_column(column: &ColumnDef, warnings: &mut Vec<String>) -> Result<(String, Vec<String>), MiddlewareError> {
@@ -154,6 +369,18 @@ fn translate_column(column: &ColumnDef, warnings: &mut Vec<String>) -> Result<(S
             ColumnOption::CharacterSet(_) | ColumnOption::Collation(_) => {
                 warnings.push(format!(
                     "dropped MySQL character set/collation column option from `{}`",
+                    column.name
+                ));
+            }
+            ColumnOption::Comment(_) => {
+                warnings.push(format!(
+                    "dropped MySQL column comment from `{}`",
+                    column.name
+                ));
+            }
+            ColumnOption::Invisible => {
+                warnings.push(format!(
+                    "dropped MySQL INVISIBLE column attribute from `{}`",
                     column.name
                 ));
             }
@@ -185,6 +412,11 @@ fn translate_data_type(
     warnings: &mut Vec<String>,
 ) -> String {
     match data_type {
+        DataType::TinyInt(_) => "SMALLINT".to_string(),
+        DataType::Int2(_) | DataType::SmallInt(_) => "SMALLINT".to_string(),
+        DataType::MediumInt(_) => "INTEGER".to_string(),
+        DataType::Int(_) | DataType::Int4(_) | DataType::Integer(_) => "INTEGER".to_string(),
+        DataType::BigInt(_) | DataType::Int8(_) => "BIGINT".to_string(),
         DataType::BigIntUnsigned(_) | DataType::Int8Unsigned(_) => {
             warnings.push(format!(
                 "mapped `{column_name}` from BIGINT UNSIGNED to BIGINT; PostgreSQL cannot represent the full unsigned 64-bit range in a native integer identity column"
@@ -226,19 +458,22 @@ fn translate_data_type(
             push_non_negative_check(extra_constraints, column_name);
             format!("NUMERIC{}", render_exact_number_info(info))
         }
+        DataType::Decimal(info) | DataType::Dec(info) | DataType::Numeric(info) => {
+            format!("NUMERIC{}", render_exact_number_info(info))
+        }
         DataType::FloatUnsigned(info) => {
             warnings.push(format!(
-                "mapped `{column_name}` from unsigned FLOAT to DOUBLE PRECISION and added a non-negative CHECK constraint"
+                "mapped `{column_name}` from unsigned FLOAT to REAL and added a non-negative CHECK constraint"
             ));
             push_non_negative_check(extra_constraints, column_name);
-            render_float_type(info)
+            render_float_type(info, true)
         }
         DataType::DoubleUnsigned(info) => {
             warnings.push(format!(
                 "mapped `{column_name}` from unsigned DOUBLE to DOUBLE PRECISION and added a non-negative CHECK constraint"
             ));
             push_non_negative_check(extra_constraints, column_name);
-            render_double_type(info)
+            render_double_type(info, true)
         }
         DataType::DoublePrecisionUnsigned | DataType::RealUnsigned => {
             warnings.push(format!(
@@ -247,6 +482,11 @@ fn translate_data_type(
             push_non_negative_check(extra_constraints, column_name);
             "DOUBLE PRECISION".to_string()
         }
+        DataType::Float(info) => render_float_type(info, false),
+        DataType::Real | DataType::Float4 | DataType::Float32 => "REAL".to_string(),
+        DataType::Double(info) => render_double_type(info, false),
+        DataType::DoublePrecision | DataType::Float8 | DataType::Float64 => "DOUBLE PRECISION".to_string(),
+        DataType::Bool => "BOOLEAN".to_string(),
         DataType::Enum(values, _) => {
             warnings.push(format!(
                 "rewrote MySQL ENUM column `{column_name}` to TEXT with a CHECK constraint"
@@ -260,10 +500,12 @@ fn translate_data_type(
             ));
             "TEXT".to_string()
         }
-        DataType::TinyText | DataType::MediumText | DataType::LongText => "TEXT".to_string(),
-        DataType::TinyBlob | DataType::MediumBlob | DataType::LongBlob => "BYTEA".to_string(),
+        DataType::JSON => "JSONB".to_string(),
+        DataType::TinyText | DataType::MediumText | DataType::LongText | DataType::Text | DataType::String(_) => "TEXT".to_string(),
+        DataType::Binary(_) | DataType::Varbinary(_) | DataType::Blob(_) | DataType::TinyBlob | DataType::MediumBlob | DataType::LongBlob | DataType::Bytes(_) => "BYTEA".to_string(),
         DataType::Datetime(precision) => render_timestamp_type(*precision, false),
         DataType::Timestamp(precision, TimezoneInfo::None) => render_timestamp_type(*precision, false),
+        DataType::Timestamp(precision, _) => render_timestamp_type(*precision, true),
         _ => data_type.to_string(),
     }
 }
@@ -276,17 +518,23 @@ fn render_exact_number_info(info: &ExactNumberInfo) -> String {
     }
 }
 
-fn render_float_type(info: &ExactNumberInfo) -> String {
+fn render_float_type(info: &ExactNumberInfo, unsigned: bool) -> String {
     match info {
-        ExactNumberInfo::None => "DOUBLE PRECISION".to_string(),
-        _ => "DOUBLE PRECISION".to_string(),
+        ExactNumberInfo::None => "REAL".to_string(),
+        _ => {
+            let _ = unsigned;
+            "REAL".to_string()
+        }
     }
 }
 
-fn render_double_type(info: &ExactNumberInfo) -> String {
+fn render_double_type(info: &ExactNumberInfo, unsigned: bool) -> String {
     match info {
         ExactNumberInfo::None => "DOUBLE PRECISION".to_string(),
-        _ => "DOUBLE PRECISION".to_string(),
+        _ => {
+            let _ = unsigned;
+            "DOUBLE PRECISION".to_string()
+        }
     }
 }
 
