@@ -31,7 +31,7 @@ impl PostgresExecutor for TokioPostgresExecutor {
     async fn execute_sql(&self, sql: &str) -> Result<QueryResult, MiddlewareError> {
         let (client, connection) = tokio_postgres::connect(&self.connection_string, NoTls)
             .await
-            .map_err(|e| MiddlewareError::Execution(format!("failed to connect to PostgreSQL: {e}")))?;
+            .map_err(|e| MiddlewareError::Execution(format!("failed to connect to PostgreSQL: {}", format_pg_error(&e))))?;
 
         tokio::spawn(async move {
             if let Err(err) = connection.await {
@@ -49,7 +49,7 @@ impl PostgresExecutor for TokioPostgresExecutor {
             let affected = client
                 .execute(sql, &[])
                 .await
-                .map_err(|e| MiddlewareError::Execution(format!("statement failed: {e}")))?;
+                .map_err(|e| MiddlewareError::Execution(format!("statement failed: {}", format_pg_error(&e))))?;
             return Ok(QueryResult {
                 columns: vec![],
                 rows: vec![],
@@ -60,7 +60,7 @@ impl PostgresExecutor for TokioPostgresExecutor {
         let statement = client
             .prepare(sql)
             .await
-            .map_err(|e| MiddlewareError::Execution(format!("failed to prepare translated query: {e}")))?;
+            .map_err(|e| MiddlewareError::Execution(format!("failed to prepare translated query: {}", format_pg_error(&e))))?;
 
         let columns = statement
             .columns()
@@ -71,7 +71,7 @@ impl PostgresExecutor for TokioPostgresExecutor {
         let rows = client
             .query(&statement, &[])
             .await
-            .map_err(|e| MiddlewareError::Execution(format!("query failed: {e}")))?;
+            .map_err(|e| MiddlewareError::Execution(format!("query failed: {}", format_pg_error(&e))))?;
 
         let row_count = rows.len() as u64;
         let rendered_rows = rows
@@ -91,6 +91,35 @@ impl PostgresExecutor for TokioPostgresExecutor {
             row_count,
         })
     }
+}
+
+fn format_pg_error(err: &tokio_postgres::Error) -> String {
+    if let Some(db_err) = err.as_db_error() {
+        let mut parts = vec![db_err.message().to_string()];
+
+        if let Some(detail) = db_err.detail() {
+            parts.push(format!("detail: {detail}"));
+        }
+        if let Some(hint) = db_err.hint() {
+            parts.push(format!("hint: {hint}"));
+        }
+        if let Some(schema) = db_err.schema() {
+            parts.push(format!("schema: {schema}"));
+        }
+        if let Some(table) = db_err.table() {
+            parts.push(format!("table: {table}"));
+        }
+        if let Some(column) = db_err.column() {
+            parts.push(format!("column: {column}"));
+        }
+        if let Some(constraint) = db_err.constraint() {
+            parts.push(format!("constraint: {constraint}"));
+        }
+
+        return parts.join(" | ");
+    }
+
+    err.to_string()
 }
 
 fn value_to_string(row: &tokio_postgres::Row, idx: usize, ty: &Type) -> String {

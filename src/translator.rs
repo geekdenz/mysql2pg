@@ -1,5 +1,6 @@
 use regex::{Captures, Regex};
 use serde::Serialize;
+use sqlparser::ast::{ColumnDef, ColumnOption, CreateTable, DataType, ExactNumberInfo, Statement, TimezoneInfo};
 
 use crate::{config::TranslatorConfig, error::MiddlewareError, parser::parse_mysql_sql};
 
@@ -24,7 +25,7 @@ pub fn translate_sql(sql: &str, cfg: &TranslatorConfig) -> Result<TranslationRes
         .join("; ");
 
     let mut warnings = Vec::new();
-    let mut translated = canonical_mysql_sql.clone();
+    let mut translated = translate_statements(&statements, &mut warnings)?;
 
     if cfg.normalize_mysql_backticks {
         translated = replace_backticks(&translated);
@@ -57,6 +58,277 @@ pub fn translate_sql(sql: &str, cfg: &TranslatorConfig) -> Result<TranslationRes
 
 fn replace_backticks(sql: &str) -> String {
     sql.replace('`', "\"")
+}
+
+fn translate_statements(
+    statements: &[Statement],
+    warnings: &mut Vec<String>,
+) -> Result<String, MiddlewareError> {
+    statements
+        .iter()
+        .map(|stmt| translate_statement(stmt, warnings))
+        .collect::<Result<Vec<_>, _>>()
+        .map(|parts| parts.join("; "))
+}
+
+fn translate_statement(stmt: &Statement, warnings: &mut Vec<String>) -> Result<String, MiddlewareError> {
+    match stmt {
+        Statement::CreateTable(create) => translate_create_table(create, warnings),
+        _ => Ok(stmt.to_string()),
+    }
+}
+
+fn translate_create_table(
+    create: &CreateTable,
+    warnings: &mut Vec<String>,
+) -> Result<String, MiddlewareError> {
+    if create.or_replace || create.temporary || create.external || create.dynamic || create.global.is_some()
+        || create.transient || create.volatile || create.iceberg || create.query.is_some()
+        || create.without_rowid || create.like.is_some() || create.clone.is_some()
+        || create.version.is_some() || create.comment.is_some() || create.on_commit.is_some()
+        || create.on_cluster.is_some() || create.primary_key.is_some() || create.order_by.is_some()
+        || create.partition_by.is_some() || create.cluster_by.is_some() || create.clustered_by.is_some()
+        || create.inherits.is_some() || create.partition_of.is_some() || create.for_values.is_some()
+        || create.strict || create.copy_grants || create.enable_schema_evolution.is_some()
+        || create.change_tracking.is_some() || create.data_retention_time_in_days.is_some()
+        || create.max_data_extension_time_in_days.is_some() || create.default_ddl_collation.is_some()
+        || create.with_aggregation_policy.is_some() || create.with_row_access_policy.is_some()
+        || create.with_tags.is_some() || create.external_volume.is_some() || create.base_location.is_some()
+        || create.catalog.is_some() || create.catalog_sync.is_some() || create.storage_serialization_policy.is_some()
+        || create.target_lag.is_some() || create.warehouse.is_some() || create.refresh_mode.is_some()
+        || create.initialize.is_some() || create.require_user
+    {
+        return Err(MiddlewareError::Translation(
+            "complex CREATE TABLE variants are not yet supported for PostgreSQL translation".to_string(),
+        ));
+    }
+
+    let mut rendered_items = Vec::new();
+    let mut extra_constraints = Vec::new();
+
+    for column in &create.columns {
+        let (rendered, constraints) = translate_column(column, warnings)?;
+        rendered_items.push(rendered);
+        extra_constraints.extend(constraints);
+    }
+
+    for constraint in &create.constraints {
+        rendered_items.push(constraint.to_string());
+    }
+    rendered_items.extend(extra_constraints);
+
+    if !matches!(create.table_options, sqlparser::ast::CreateTableOptions::None) {
+        warnings.push("stripped MySQL-specific CREATE TABLE options".to_string());
+    }
+
+    let if_not_exists = if create.if_not_exists { "IF NOT EXISTS " } else { "" };
+    Ok(format!(
+        "CREATE TABLE {if_not_exists}{} ({})",
+        create.name,
+        rendered_items.join(", ")
+    ))
+}
+
+fn translate_column(column: &ColumnDef, warnings: &mut Vec<String>) -> Result<(String, Vec<String>), MiddlewareError> {
+    let mut extra_constraints = Vec::new();
+    let mut auto_increment = false;
+    let mut rendered_options = Vec::new();
+
+    let translated_type = translate_data_type(&column.name.to_string(), &column.data_type, &mut extra_constraints, warnings);
+
+    for option in &column.options {
+        match &option.option {
+            ColumnOption::DialectSpecific(tokens) if is_auto_increment(tokens) => {
+                auto_increment = true;
+                warnings.push(format!(
+                    "rewrote AUTO_INCREMENT on column `{}` to PostgreSQL identity",
+                    column.name
+                ));
+            }
+            ColumnOption::OnUpdate(_) => {
+                warnings.push(format!(
+                    "dropped MySQL ON UPDATE clause from column `{}`; PostgreSQL requires a trigger for equivalent behavior",
+                    column.name
+                ));
+            }
+            ColumnOption::CharacterSet(_) | ColumnOption::Collation(_) => {
+                warnings.push(format!(
+                    "dropped MySQL character set/collation column option from `{}`",
+                    column.name
+                ));
+            }
+            other => rendered_options.push(other.to_string()),
+        }
+    }
+
+    if auto_increment {
+        rendered_options.push("GENERATED BY DEFAULT AS IDENTITY".to_string());
+    }
+
+    let mut rendered = format!("{} {}", column.name, translated_type);
+    if !rendered_options.is_empty() {
+        rendered.push(' ');
+        rendered.push_str(&rendered_options.join(" "));
+    }
+
+    Ok((rendered, extra_constraints))
+}
+
+fn is_auto_increment(tokens: &[sqlparser::tokenizer::Token]) -> bool {
+    tokens.len() == 1 && tokens[0].to_string().eq_ignore_ascii_case("AUTO_INCREMENT")
+}
+
+fn translate_data_type(
+    column_name: &str,
+    data_type: &DataType,
+    extra_constraints: &mut Vec<String>,
+    warnings: &mut Vec<String>,
+) -> String {
+    match data_type {
+        DataType::BigIntUnsigned(_) | DataType::Int8Unsigned(_) => {
+            warnings.push(format!(
+                "mapped `{column_name}` from BIGINT UNSIGNED to BIGINT; PostgreSQL cannot represent the full unsigned 64-bit range in a native integer identity column"
+            ));
+            "BIGINT".to_string()
+        }
+        DataType::IntegerUnsigned(_) | DataType::IntUnsigned(_) | DataType::Int4Unsigned(_) => {
+            warnings.push(format!(
+                "mapped `{column_name}` from INT UNSIGNED to BIGINT to preserve the MySQL value range"
+            ));
+            push_unsigned_check(extra_constraints, column_name, "4294967295");
+            "BIGINT".to_string()
+        }
+        DataType::SmallIntUnsigned(_) | DataType::Int2Unsigned(_) => {
+            warnings.push(format!(
+                "mapped `{column_name}` from SMALLINT UNSIGNED to INTEGER to preserve the MySQL value range"
+            ));
+            push_unsigned_check(extra_constraints, column_name, "65535");
+            "INTEGER".to_string()
+        }
+        DataType::TinyIntUnsigned(_) => {
+            warnings.push(format!(
+                "mapped `{column_name}` from TINYINT UNSIGNED to SMALLINT to preserve the MySQL value range"
+            ));
+            push_unsigned_check(extra_constraints, column_name, "255");
+            "SMALLINT".to_string()
+        }
+        DataType::MediumIntUnsigned(_) => {
+            warnings.push(format!(
+                "mapped `{column_name}` from MEDIUMINT UNSIGNED to INTEGER to preserve the MySQL value range"
+            ));
+            push_unsigned_check(extra_constraints, column_name, "16777215");
+            "INTEGER".to_string()
+        }
+        DataType::DecimalUnsigned(info) | DataType::DecUnsigned(info) => {
+            warnings.push(format!(
+                "mapped `{column_name}` from unsigned DECIMAL to NUMERIC and added a non-negative CHECK constraint"
+            ));
+            push_non_negative_check(extra_constraints, column_name);
+            format!("NUMERIC{}", render_exact_number_info(info))
+        }
+        DataType::FloatUnsigned(info) => {
+            warnings.push(format!(
+                "mapped `{column_name}` from unsigned FLOAT to DOUBLE PRECISION and added a non-negative CHECK constraint"
+            ));
+            push_non_negative_check(extra_constraints, column_name);
+            render_float_type(info)
+        }
+        DataType::DoubleUnsigned(info) => {
+            warnings.push(format!(
+                "mapped `{column_name}` from unsigned DOUBLE to DOUBLE PRECISION and added a non-negative CHECK constraint"
+            ));
+            push_non_negative_check(extra_constraints, column_name);
+            render_double_type(info)
+        }
+        DataType::DoublePrecisionUnsigned | DataType::RealUnsigned => {
+            warnings.push(format!(
+                "mapped `{column_name}` from unsigned floating-point to DOUBLE PRECISION and added a non-negative CHECK constraint"
+            ));
+            push_non_negative_check(extra_constraints, column_name);
+            "DOUBLE PRECISION".to_string()
+        }
+        DataType::Enum(values, _) => {
+            warnings.push(format!(
+                "rewrote MySQL ENUM column `{column_name}` to TEXT with a CHECK constraint"
+            ));
+            push_enum_check(extra_constraints, column_name, values);
+            "TEXT".to_string()
+        }
+        DataType::Set(_) => {
+            warnings.push(format!(
+                "mapped MySQL SET column `{column_name}` to TEXT; membership semantics are not preserved"
+            ));
+            "TEXT".to_string()
+        }
+        DataType::TinyText | DataType::MediumText | DataType::LongText => "TEXT".to_string(),
+        DataType::TinyBlob | DataType::MediumBlob | DataType::LongBlob => "BYTEA".to_string(),
+        DataType::Datetime(precision) => render_timestamp_type(*precision, false),
+        DataType::Timestamp(precision, TimezoneInfo::None) => render_timestamp_type(*precision, false),
+        _ => data_type.to_string(),
+    }
+}
+
+fn render_exact_number_info(info: &ExactNumberInfo) -> String {
+    match info {
+        ExactNumberInfo::None => String::new(),
+        ExactNumberInfo::Precision(p) => format!("({p})"),
+        ExactNumberInfo::PrecisionAndScale(p, s) => format!("({p},{s})"),
+    }
+}
+
+fn render_float_type(info: &ExactNumberInfo) -> String {
+    match info {
+        ExactNumberInfo::None => "DOUBLE PRECISION".to_string(),
+        _ => "DOUBLE PRECISION".to_string(),
+    }
+}
+
+fn render_double_type(info: &ExactNumberInfo) -> String {
+    match info {
+        ExactNumberInfo::None => "DOUBLE PRECISION".to_string(),
+        _ => "DOUBLE PRECISION".to_string(),
+    }
+}
+
+fn render_timestamp_type(precision: Option<u64>, with_time_zone: bool) -> String {
+    let base = if with_time_zone {
+        "TIMESTAMP WITH TIME ZONE"
+    } else {
+        "TIMESTAMP"
+    };
+    match precision {
+        Some(precision) => format!("{base}({precision})"),
+        None => base.to_string(),
+    }
+}
+
+fn push_non_negative_check(extra_constraints: &mut Vec<String>, column_name: &str) {
+    extra_constraints.push(format!(
+        "CHECK ({column_name} >= 0)"
+    ));
+}
+
+fn push_unsigned_check(extra_constraints: &mut Vec<String>, column_name: &str, max: &str) {
+    extra_constraints.push(format!(
+        "CHECK ({column_name} >= 0 AND {column_name} <= {max})"
+    ));
+}
+
+fn push_enum_check(
+    extra_constraints: &mut Vec<String>,
+    column_name: &str,
+    values: &[sqlparser::ast::EnumMember],
+) {
+    let allowed = values
+        .iter()
+        .map(|value| match value {
+            sqlparser::ast::EnumMember::Name(name) => format!("'{}'", name.replace('\'', "''")),
+            sqlparser::ast::EnumMember::NamedValue(name, _) => format!("'{}'", name.replace('\'', "''")),
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    extra_constraints.push(format!("CHECK ({column_name} IN ({allowed}))"));
 }
 
 fn rewrite_limit_offset_count(sql: &str, warnings: &mut Vec<String>) -> String {
@@ -247,5 +519,41 @@ mod tests {
     fn simple_select_does_not_panic_during_boolean_normalization() {
         let result = translate_sql("select 1", &TranslatorConfig::default()).unwrap();
         assert_eq!(result.translated_sql, "SELECT 1");
+    }
+
+    #[test]
+    fn rewrites_mysql_create_table_for_postgres() {
+        let sql = r#"
+            CREATE TABLE IF NOT EXISTS order_details (
+                order_id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+                product_id INT UNSIGNED NOT NULL,
+                customer_id INT UNSIGNED NOT NULL,
+                quantity SMALLINT NOT NULL DEFAULT 1,
+                price DECIMAL(10, 2) NOT NULL,
+                discount DECIMAL(3, 2) DEFAULT 0.00,
+                status ENUM('pending', 'shipped', 'delivered', 'cancelled') DEFAULT 'pending',
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                PRIMARY KEY (order_id),
+                UNIQUE KEY unique_order_prod (order_id, product_id),
+                CONSTRAINT fk_product FOREIGN KEY (product_id) REFERENCES products(id) ON DELETE CASCADE,
+                CONSTRAINT chk_quantity CHECK (quantity > 0)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+        "#;
+
+        let result = translate_sql(sql, &TranslatorConfig::default()).unwrap();
+
+        assert!(result.translated_sql.contains("CREATE TABLE IF NOT EXISTS order_details"));
+        assert!(result.translated_sql.contains("order_id BIGINT NOT NULL GENERATED BY DEFAULT AS IDENTITY"));
+        assert!(result.translated_sql.contains("product_id BIGINT NOT NULL"));
+        assert!(result.translated_sql.contains("customer_id BIGINT NOT NULL"));
+        assert!(result.translated_sql.contains("status TEXT DEFAULT 'pending'"));
+        assert!(result.translated_sql.contains("CHECK (status IN ('pending', 'shipped', 'delivered', 'cancelled'))"));
+        assert!(result.translated_sql.contains("CHECK (product_id >= 0 AND product_id <= 4294967295)"));
+        assert!(result.translated_sql.contains("CHECK (customer_id >= 0 AND customer_id <= 4294967295)"));
+        assert!(!result.translated_sql.contains("AUTO_INCREMENT"));
+        assert!(!result.translated_sql.contains("UNSIGNED"));
+        assert!(!result.translated_sql.contains("ON UPDATE CURRENT_TIMESTAMP"));
+        assert!(!result.translated_sql.contains("ENGINE = InnoDB"));
     }
 }
