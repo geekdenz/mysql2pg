@@ -63,3 +63,15 @@ fn show_tables_translation_smoke() {
     assert!(result.translated_sql.contains("table_name LIKE 'ord%'"));
     assert!(result.translated_sql.contains("AS \"Tables_in_current_schema\""));
 }
+
+#[test]
+fn describe_table_translation_smoke() {
+    let result = translate_sql("DESC order_details", &TranslatorConfig::default()).unwrap();
+    assert!(result.translated_sql.contains("AS \"Field\""));
+    assert!(result.translated_sql.contains("AS \"Type\""));
+    assert!(result.translated_sql.contains("AS \"Null\""));
+    assert!(result.translated_sql.contains("AS \"Key\""));
+    assert!(result.translated_sql.contains("AS \"Default\""));
+    assert!(result.translated_sql.contains("AS \"Extra\""));
+    assert!(result.translated_sql.contains("WHERE c.table_schema = 'public' AND c.table_name = 'order_details'"));
+}

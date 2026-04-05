@@ -1,7 +1,7 @@
 use regex::{Captures, Regex};
 use serde::Serialize;
 use sqlparser::ast::{
-    ColumnDef, ColumnOption, CreateTable, DataType, ExactNumberInfo, ShowStatementFilter,
+    ColumnDef, ColumnOption, CreateTable, DataType, ExactNumberInfo, ObjectName, ShowStatementFilter,
     ShowStatementFilterPosition, ShowStatementInParentType, ShowStatementOptions, Statement,
     TableConstraint, TimezoneInfo,
 };
@@ -30,6 +30,7 @@ pub fn translate_sql(sql: &str, cfg: &TranslatorConfig) -> Result<TranslationRes
 
     let mut warnings = Vec::new();
     let mut translated = translate_statements(&statements, &mut warnings)?;
+    let requires_unsupported_rejection = statements.iter().all(statement_requires_unsupported_rejection);
 
     if cfg.normalize_mysql_backticks {
         translated = replace_backticks(&translated);
@@ -50,7 +51,9 @@ pub fn translate_sql(sql: &str, cfg: &TranslatorConfig) -> Result<TranslationRes
         translated = strip_mysql_table_options(&translated, &mut warnings);
     }
 
-    reject_unsupported(&translated)?;
+    if requires_unsupported_rejection {
+        reject_unsupported(&translated)?;
+    }
 
     Ok(TranslationResult {
         original_sql: sql.to_string(),
@@ -58,6 +61,10 @@ pub fn translate_sql(sql: &str, cfg: &TranslatorConfig) -> Result<TranslationRes
         translated_sql: translated,
         warnings,
     })
+}
+
+fn statement_requires_unsupported_rejection(stmt: &Statement) -> bool {
+    !matches!(stmt, Statement::ShowTables { .. } | Statement::ExplainTable { .. })
 }
 
 fn replace_backticks(sql: &str) -> String {
@@ -94,8 +101,65 @@ fn translate_statement(stmt: &Statement, warnings: &mut Vec<String>) -> Result<S
             show_options,
             warnings,
         ),
+        Statement::ExplainTable { table_name, .. } => translate_describe_table(table_name, warnings),
         _ => Ok(stmt.to_string()),
     }
+}
+
+fn translate_describe_table(
+    table_name: &ObjectName,
+    warnings: &mut Vec<String>,
+) -> Result<String, MiddlewareError> {
+    let (schema_name, relation_name) = split_object_name(table_name)?;
+    let schema_expr = sql_string_literal(schema_name.as_deref().unwrap_or("public"));
+    let relation_expr = sql_string_literal(&relation_name);
+
+    warnings.push("rewrote MySQL DESC/DESCRIBE to PostgreSQL catalog query".to_string());
+
+    Ok(format!(
+        "SELECT c.column_name AS \"Field\", \
+                pg_catalog.format_type(a.atttypid, a.atttypmod) AS \"Type\", \
+                CASE WHEN c.is_nullable = 'YES' THEN 'YES' ELSE 'NO' END AS \"Null\", \
+                CASE \
+                    WHEN EXISTS ( \
+                        SELECT 1 \
+                        FROM pg_constraint pc \
+                        JOIN pg_attribute pa ON pa.attrelid = pc.conrelid AND pa.attnum = ANY(pc.conkey) \
+                        WHERE pc.conrelid = cls.oid AND pa.attname = c.column_name AND pc.contype = 'p' \
+                    ) THEN 'PRI' \
+                    WHEN EXISTS ( \
+                        SELECT 1 \
+                        FROM pg_constraint pc \
+                        JOIN pg_attribute pa ON pa.attrelid = pc.conrelid AND pa.attnum = ANY(pc.conkey) \
+                        WHERE pc.conrelid = cls.oid AND pa.attname = c.column_name AND pc.contype = 'u' AND cardinality(pc.conkey) = 1 \
+                    ) THEN 'UNI' \
+                    WHEN EXISTS ( \
+                        SELECT 1 \
+                        FROM pg_index pi \
+                        JOIN pg_attribute pa ON pa.attrelid = pi.indrelid AND pa.attnum = ANY(pi.indkey) \
+                        WHERE pi.indrelid = cls.oid AND pa.attname = c.column_name \
+                    ) OR EXISTS ( \
+                        SELECT 1 \
+                        FROM pg_constraint pc \
+                        JOIN pg_attribute pa ON pa.attrelid = pc.conrelid AND pa.attnum = ANY(pc.conkey) \
+                        WHERE pc.conrelid = cls.oid AND pa.attname = c.column_name AND pc.contype = 'f' \
+                    ) THEN 'MUL' \
+                    ELSE '' \
+                END AS \"Key\", \
+                c.column_default AS \"Default\", \
+                CASE \
+                    WHEN c.is_identity = 'YES' THEN 'auto_increment' \
+                    WHEN pg_get_expr(ad.adbin, ad.adrelid) LIKE 'nextval(%' THEN 'auto_increment' \
+                    ELSE '' \
+                END AS \"Extra\" \
+         FROM information_schema.columns c \
+         JOIN pg_namespace ns ON ns.nspname = c.table_schema \
+         JOIN pg_class cls ON cls.relname = c.table_name AND cls.relnamespace = ns.oid \
+         JOIN pg_attribute a ON a.attrelid = cls.oid AND a.attname = c.column_name \
+         LEFT JOIN pg_attrdef ad ON ad.adrelid = cls.oid AND ad.adnum = a.attnum \
+         WHERE c.table_schema = {schema_expr} AND c.table_name = {relation_expr} \
+         ORDER BY c.ordinal_position"
+    ))
 }
 
 fn translate_show_tables(
@@ -193,6 +257,30 @@ fn translate_show_tables_filter(
             "SHOW TABLES ... WHERE is not supported yet".to_string(),
         )),
     }
+}
+
+fn split_object_name(table_name: &ObjectName) -> Result<(Option<String>, String), MiddlewareError> {
+    let parts = table_name
+        .0
+        .iter()
+        .map(|part| {
+            part.as_ident()
+                .map(|ident| ident.value.clone())
+                .ok_or_else(|| MiddlewareError::Translation("function-style object names are not supported here".to_string()))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    match parts.as_slice() {
+        [table] => Ok((None, table.clone())),
+        [schema, table] => Ok((Some(schema.clone()), table.clone())),
+        _ => Err(MiddlewareError::Translation(format!(
+            "unsupported object name `{table_name}`"
+        ))),
+    }
+}
+
+fn sql_string_literal(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
 }
 
 fn translate_create_table(
