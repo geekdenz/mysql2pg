@@ -115,7 +115,7 @@ fn value_to_string(row: &tokio_postgres::Row, idx: usize, ty: &Type) -> String {
             .try_get::<usize, Option<Vec<u8>>>(idx)
             .ok()
             .flatten()
-            .map(|bytes| format!("\x{}", bytes.iter().map(|b| format!("{:02x}", b)).collect::<String>()))
+            .map(|bytes| format!("\\x{}", bytes.iter().map(|b| format!("{:02x}", b)).collect::<String>()))
             .unwrap_or_default(),
         _ => row
             .try_get::<usize, Option<String>>(idx)
