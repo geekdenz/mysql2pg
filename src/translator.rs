@@ -1,9 +1,9 @@
 use regex::{Captures, Regex};
 use serde::Serialize;
 use sqlparser::ast::{
-    ColumnDef, ColumnOption, CreateTable, DataType, ExactNumberInfo, ObjectName, ShowStatementFilter,
-    ShowStatementFilterPosition, ShowStatementInParentType, ShowStatementOptions, Statement,
-    TableConstraint, TimezoneInfo,
+    ColumnDef, ColumnOption, CreateTable, DataType, ExactNumberInfo, ObjectName, ShowCharset,
+    ShowCreateObject, ShowStatementFilter, ShowStatementFilterPosition, ShowStatementInParentType,
+    ShowStatementOptions, Statement, TableConstraint, TimezoneInfo,
 };
 
 use crate::{config::TranslatorConfig, error::MiddlewareError, parser::parse_mysql_sql};
@@ -64,7 +64,21 @@ pub fn translate_sql(sql: &str, cfg: &TranslatorConfig) -> Result<TranslationRes
 }
 
 fn statement_requires_unsupported_rejection(stmt: &Statement) -> bool {
-    !matches!(stmt, Statement::ShowTables { .. } | Statement::ExplainTable { .. })
+    !matches!(
+        stmt,
+        Statement::ShowTables { .. }
+            | Statement::ShowDatabases { .. }
+            | Statement::ShowSchemas { .. }
+            | Statement::ShowViews { .. }
+            | Statement::ShowFunctions { .. }
+            | Statement::ShowCollation { .. }
+            | Statement::ShowCharset { .. }
+            | Statement::ShowVariables { .. }
+            | Statement::ShowStatus { .. }
+            | Statement::ShowColumns { .. }
+            | Statement::ShowCreate { .. }
+            | Statement::ExplainTable { .. }
+    )
 }
 
 fn replace_backticks(sql: &str) -> String {
@@ -101,6 +115,34 @@ fn translate_statement(stmt: &Statement, warnings: &mut Vec<String>) -> Result<S
             show_options,
             warnings,
         ),
+        Statement::ShowDatabases { terse, history, show_options } => {
+            translate_show_databases(*terse, *history, show_options, warnings)
+        }
+        Statement::ShowSchemas { terse, history, show_options } => {
+            translate_show_schemas(*terse, *history, show_options, warnings)
+        }
+        Statement::ShowViews {
+            terse,
+            materialized,
+            show_options,
+        } => translate_show_views(*terse, *materialized, show_options, warnings),
+        Statement::ShowFunctions { filter } => translate_show_functions(filter.as_ref(), warnings),
+        Statement::ShowCollation { filter } => translate_show_collation(filter.as_ref(), warnings),
+        Statement::ShowCharset(show_charset) => translate_show_charset(show_charset, warnings),
+        Statement::ShowVariables {
+            filter,
+            global,
+            session,
+        } => translate_show_variables(filter.as_ref(), *global, *session, warnings),
+        Statement::ShowStatus {
+            filter,
+            global,
+            session,
+        } => translate_show_status(filter.as_ref(), *global, *session, warnings),
+        Statement::ShowColumns { extended, full, show_options } => {
+            translate_show_columns(*extended, *full, show_options, warnings)
+        }
+        Statement::ShowCreate { obj_type, obj_name } => translate_show_create(obj_type, obj_name, warnings),
         Statement::ExplainTable { table_name, .. } => translate_describe_table(table_name, warnings),
         _ => Ok(stmt.to_string()),
     }
@@ -110,13 +152,20 @@ fn translate_describe_table(
     table_name: &ObjectName,
     warnings: &mut Vec<String>,
 ) -> Result<String, MiddlewareError> {
+    translate_describe_like_query(table_name, None, false, warnings)
+}
+
+fn translate_describe_like_query(
+    table_name: &ObjectName,
+    filter: Option<&ShowStatementFilter>,
+    full: bool,
+    warnings: &mut Vec<String>,
+) -> Result<String, MiddlewareError> {
     let (schema_name, relation_name) = split_object_name(table_name)?;
     let schema_expr = sql_string_literal(schema_name.as_deref().unwrap_or("public"));
     let relation_expr = sql_string_literal(&relation_name);
 
-    warnings.push("rewrote MySQL DESC/DESCRIBE to PostgreSQL catalog query".to_string());
-
-    Ok(format!(
+    let mut sql = format!(
         "SELECT c.column_name AS \"Field\", \
                 pg_catalog.format_type(a.atttypid, a.atttypmod) AS \"Type\", \
                 CASE WHEN c.is_nullable = 'YES' THEN 'YES' ELSE 'NO' END AS \"Null\", \
@@ -157,9 +206,25 @@ fn translate_describe_table(
          JOIN pg_class cls ON cls.relname = c.table_name AND cls.relnamespace = ns.oid \
          JOIN pg_attribute a ON a.attrelid = cls.oid AND a.attname = c.column_name \
          LEFT JOIN pg_attrdef ad ON ad.adrelid = cls.oid AND ad.adnum = a.attnum \
-         WHERE c.table_schema = {schema_expr} AND c.table_name = {relation_expr} \
-         ORDER BY c.ordinal_position"
-    ))
+         WHERE c.table_schema = {schema_expr} AND c.table_name = {relation_expr}"
+    );
+
+    if let Some(filter_sql) = translate_named_filter(filter, "c.column_name")? {
+        sql.push_str(" AND ");
+        sql.push_str(&filter_sql);
+    }
+
+    if full {
+        sql = sql.replacen(
+            " AS \"Extra\" ",
+            " AS \"Extra\", NULL::text AS \"Privileges\", NULL::text AS \"Comment\" ",
+            1,
+        );
+    }
+
+    sql.push_str(" ORDER BY c.ordinal_position");
+    warnings.push("rewrote MySQL DESC/DESCRIBE/SHOW COLUMNS to PostgreSQL catalog query".to_string());
+    Ok(sql)
 }
 
 fn translate_show_tables(
@@ -238,25 +303,320 @@ fn resolve_show_tables_schema(show_options: &ShowStatementOptions) -> Result<(St
 fn translate_show_tables_filter(
     show_options: &ShowStatementOptions,
 ) -> Result<Option<String>, MiddlewareError> {
-    let Some(filter_position) = &show_options.filter_position else {
-        return Ok(None);
-    };
+    translate_named_filter(extract_show_filter(show_options), "table_name")
+}
 
-    let filter = match filter_position {
-        ShowStatementFilterPosition::Infix(filter) | ShowStatementFilterPosition::Suffix(filter) => filter,
-    };
-
-    match filter {
-        ShowStatementFilter::Like(pattern)
-        | ShowStatementFilter::ILike(pattern)
-        | ShowStatementFilter::NoKeyword(pattern) => Ok(Some(format!(
-            "table_name LIKE '{}'",
-            pattern.replace('\'', "''")
-        ))),
-        ShowStatementFilter::Where(_) => Err(MiddlewareError::Translation(
-            "SHOW TABLES ... WHERE is not supported yet".to_string(),
-        )),
+fn translate_show_databases(
+    terse: bool,
+    history: bool,
+    show_options: &ShowStatementOptions,
+    warnings: &mut Vec<String>,
+) -> Result<String, MiddlewareError> {
+    if terse || history {
+        return Err(MiddlewareError::Translation(
+            "SHOW DATABASES TERSE/HISTORY options are not supported yet".to_string(),
+        ));
     }
+
+    if show_options.show_in.is_some() || show_options.starts_with.is_some() || show_options.limit.is_some() || show_options.limit_from.is_some() {
+        return Err(MiddlewareError::Translation(
+            "SHOW DATABASES scope/STARTS WITH/LIMIT options are not supported yet".to_string(),
+        ));
+    }
+
+    let mut sql = "SELECT datname AS \"Database\" FROM pg_database WHERE datistemplate = false ORDER BY datname".to_string();
+    if let Some(filter_sql) = translate_named_filter(extract_show_filter(show_options), "datname")? {
+        sql = format!(
+            "SELECT datname AS \"Database\" FROM pg_database WHERE datistemplate = false AND {filter_sql} ORDER BY datname"
+        );
+    }
+    warnings.push("rewrote MySQL SHOW DATABASES to pg_database query".to_string());
+    Ok(sql)
+}
+
+fn translate_show_schemas(
+    terse: bool,
+    history: bool,
+    show_options: &ShowStatementOptions,
+    warnings: &mut Vec<String>,
+) -> Result<String, MiddlewareError> {
+    if terse || history {
+        return Err(MiddlewareError::Translation(
+            "SHOW SCHEMAS TERSE/HISTORY options are not supported yet".to_string(),
+        ));
+    }
+
+    if show_options.show_in.is_some() || show_options.starts_with.is_some() || show_options.limit.is_some() || show_options.limit_from.is_some() {
+        return Err(MiddlewareError::Translation(
+            "SHOW SCHEMAS scope/STARTS WITH/LIMIT options are not supported yet".to_string(),
+        ));
+    }
+
+    let mut sql =
+        "SELECT schema_name AS \"Database\" FROM information_schema.schemata ORDER BY schema_name".to_string();
+    if let Some(filter_sql) = translate_named_filter(extract_show_filter(show_options), "schema_name")? {
+        sql = format!(
+            "SELECT schema_name AS \"Database\" FROM information_schema.schemata WHERE {filter_sql} ORDER BY schema_name"
+        );
+    }
+    warnings.push("rewrote MySQL SHOW SCHEMAS to information_schema.schemata query".to_string());
+    Ok(sql)
+}
+
+fn translate_show_views(
+    terse: bool,
+    materialized: bool,
+    show_options: &ShowStatementOptions,
+    warnings: &mut Vec<String>,
+) -> Result<String, MiddlewareError> {
+    if terse || materialized {
+        return Err(MiddlewareError::Translation(
+            "SHOW VIEWS TERSE/MATERIALIZED options are not supported yet".to_string(),
+        ));
+    }
+    if show_options.starts_with.is_some() || show_options.limit.is_some() || show_options.limit_from.is_some() {
+        return Err(MiddlewareError::Translation(
+            "SHOW VIEWS STARTS WITH/LIMIT options are not supported yet".to_string(),
+        ));
+    }
+
+    let (schema_expr, column_alias) = resolve_show_tables_schema(show_options)?;
+    let mut sql = format!(
+        "SELECT table_name AS \"{column_alias}\" FROM information_schema.views WHERE table_schema = {schema_expr}"
+    );
+    if let Some(filter_sql) = translate_show_tables_filter(show_options)? {
+        sql.push_str(" AND ");
+        sql.push_str(&filter_sql);
+    }
+    sql.push_str(" ORDER BY table_name");
+    warnings.push("rewrote MySQL SHOW VIEWS to information_schema.views query".to_string());
+    Ok(sql)
+}
+
+fn translate_show_functions(
+    filter: Option<&ShowStatementFilter>,
+    warnings: &mut Vec<String>,
+) -> Result<String, MiddlewareError> {
+    let base_sql = "SELECT routine_name AS \"Function\", routine_type AS \"Type\" \
+                    FROM information_schema.routines \
+                    WHERE routine_schema = current_schema() AND routine_type = 'FUNCTION'";
+    let sql = apply_wrapped_show_filter(base_sql, filter, "Function")?;
+    warnings.push("rewrote MySQL SHOW FUNCTIONS to information_schema.routines query".to_string());
+    Ok(format!("{sql} ORDER BY \"Function\""))
+}
+
+fn translate_show_collation(
+    filter: Option<&ShowStatementFilter>,
+    warnings: &mut Vec<String>,
+) -> Result<String, MiddlewareError> {
+    let base_sql = "SELECT * FROM (VALUES \
+                        ('utf8mb4_general_ci', 'utf8mb4', 45, 'Yes', 'Yes', 1), \
+                        ('utf8mb4_unicode_ci', 'utf8mb4', 224, '', 'Yes', 8), \
+                        ('utf8_general_ci', 'utf8', 33, '', 'Yes', 1), \
+                        ('latin1_swedish_ci', 'latin1', 8, '', 'Yes', 1) \
+                    ) AS collation_rows(\"Collation\", \"Charset\", \"Id\", \"Default\", \"Compiled\", \"Sortlen\")";
+    let sql = apply_wrapped_show_filter(base_sql, filter, "Collation")?;
+    warnings.push("rewrote MySQL SHOW COLLATION to compatibility rows".to_string());
+    Ok(format!("{sql} ORDER BY \"Collation\""))
+}
+
+fn translate_show_charset(
+    show_charset: &ShowCharset,
+    warnings: &mut Vec<String>,
+) -> Result<String, MiddlewareError> {
+    let base_sql = "SELECT * FROM (VALUES \
+                        ('utf8mb4', 'UTF-8 Unicode', 'utf8mb4_unicode_ci', 4), \
+                        ('utf8', 'UTF-8 Unicode', 'utf8_general_ci', 3), \
+                        ('latin1', 'cp1252 West European', 'latin1_swedish_ci', 1) \
+                    ) AS charset_rows(\"Charset\", \"Description\", \"Default collation\", \"Maxlen\")";
+    let sql = apply_wrapped_show_filter(base_sql, show_charset.filter.as_ref(), "Charset")?;
+    warnings.push("rewrote MySQL SHOW CHARSET/CHARACTER SET to compatibility rows".to_string());
+    Ok(format!("{sql} ORDER BY \"Charset\""))
+}
+
+fn translate_show_variables(
+    filter: Option<&ShowStatementFilter>,
+    global: bool,
+    session: bool,
+    warnings: &mut Vec<String>,
+) -> Result<String, MiddlewareError> {
+    if global && session {
+        return Err(MiddlewareError::Translation(
+            "SHOW GLOBAL SESSION VARIABLES is not supported".to_string(),
+        ));
+    }
+
+    let base_sql = "WITH vars AS ( \
+                        SELECT * FROM (VALUES \
+                            ('autocommit', 'ON'), \
+                            ('character_set_client', 'utf8mb4'), \
+                            ('character_set_connection', 'utf8mb4'), \
+                            ('character_set_database', 'utf8mb4'), \
+                            ('character_set_results', 'utf8mb4'), \
+                            ('collation_connection', 'utf8mb4_unicode_ci'), \
+                            ('collation_database', 'utf8mb4_unicode_ci'), \
+                            ('lower_case_table_names', '0'), \
+                            ('max_allowed_packet', '67108864'), \
+                            ('sql_mode', 'ANSI'), \
+                            ('system_time_zone', current_setting('TimeZone')), \
+                            ('time_zone', current_setting('TimeZone')), \
+                            ('transaction_isolation', current_setting('transaction_isolation')), \
+                            ('tx_isolation', current_setting('transaction_isolation')), \
+                            ('version', '8.0.0-mysql2pg'), \
+                            ('version_comment', 'mysql2pg-middleware') \
+                        ) AS v(\"Variable_name\", \"Value\") \
+                    ) \
+                    SELECT \"Variable_name\", \"Value\" FROM vars";
+    let sql = apply_wrapped_show_filter(base_sql, filter, "Variable_name")?;
+    if global || session {
+        warnings.push("SHOW GLOBAL/SESSION VARIABLES is mapped to the current PostgreSQL session view".to_string());
+    }
+    warnings.push("rewrote MySQL SHOW VARIABLES to compatibility rows".to_string());
+    Ok(format!("{sql} ORDER BY \"Variable_name\""))
+}
+
+fn translate_show_status(
+    filter: Option<&ShowStatementFilter>,
+    global: bool,
+    session: bool,
+    warnings: &mut Vec<String>,
+) -> Result<String, MiddlewareError> {
+    if global && session {
+        return Err(MiddlewareError::Translation(
+            "SHOW GLOBAL SESSION STATUS is not supported".to_string(),
+        ));
+    }
+
+    let base_sql = "WITH status_rows AS ( \
+                        SELECT 'Connections'::text AS \"Variable_name\", COALESCE((SELECT sum(numbackends)::bigint::text FROM pg_stat_database), '0') AS \"Value\" \
+                        UNION ALL \
+                        SELECT 'Threads_connected', COALESCE((SELECT count(*)::text FROM pg_stat_activity WHERE datname = current_database()), '0') \
+                        UNION ALL \
+                        SELECT 'Threads_running', COALESCE((SELECT count(*)::text FROM pg_stat_activity WHERE datname = current_database() AND state = 'active'), '0') \
+                        UNION ALL \
+                        SELECT 'Uptime', extract(epoch FROM CURRENT_TIMESTAMP - pg_postmaster_start_time())::bigint::text \
+                    ) \
+                    SELECT \"Variable_name\", \"Value\" FROM status_rows";
+    let sql = apply_wrapped_show_filter(base_sql, filter, "Variable_name")?;
+    if global || session {
+        warnings.push("SHOW GLOBAL/SESSION STATUS is mapped to PostgreSQL activity statistics".to_string());
+    }
+    warnings.push("rewrote MySQL SHOW STATUS to PostgreSQL activity query".to_string());
+    Ok(format!("{sql} ORDER BY \"Variable_name\""))
+}
+
+fn translate_show_columns(
+    extended: bool,
+    full: bool,
+    show_options: &ShowStatementOptions,
+    warnings: &mut Vec<String>,
+) -> Result<String, MiddlewareError> {
+    if extended {
+        return Err(MiddlewareError::Translation(
+            "SHOW EXTENDED COLUMNS is not supported yet".to_string(),
+        ));
+    }
+    if show_options.starts_with.is_some() || show_options.limit.is_some() || show_options.limit_from.is_some() {
+        return Err(MiddlewareError::Translation(
+            "SHOW COLUMNS STARTS WITH/LIMIT options are not supported yet".to_string(),
+        ));
+    }
+
+    let table_name = resolve_show_columns_target(show_options)?;
+    translate_describe_like_query(&table_name, extract_show_filter(show_options), full, warnings)
+}
+
+fn resolve_show_columns_target(show_options: &ShowStatementOptions) -> Result<ObjectName, MiddlewareError> {
+    let show_in = show_options.show_in.as_ref().ok_or_else(|| {
+        MiddlewareError::Translation("SHOW COLUMNS requires a target table".to_string())
+    })?;
+
+    if let Some(parent_type) = &show_in.parent_type {
+        if !matches!(parent_type, ShowStatementInParentType::Table) {
+            return Err(MiddlewareError::Translation(format!(
+                "SHOW COLUMNS {} is not supported yet",
+                parent_type
+            )));
+        }
+    }
+
+    show_in.parent_name.clone().ok_or_else(|| {
+        MiddlewareError::Translation("SHOW COLUMNS requires a concrete table name".to_string())
+    })
+}
+
+fn translate_show_create(
+    obj_type: &ShowCreateObject,
+    obj_name: &ObjectName,
+    warnings: &mut Vec<String>,
+) -> Result<String, MiddlewareError> {
+    match obj_type {
+        ShowCreateObject::Table => translate_show_create_table(obj_name, warnings),
+        ShowCreateObject::View => translate_show_create_view(obj_name, warnings),
+        _ => Err(MiddlewareError::Translation(format!(
+            "SHOW CREATE {} is not supported yet",
+            obj_type
+        ))),
+    }
+}
+
+fn translate_show_create_table(
+    obj_name: &ObjectName,
+    warnings: &mut Vec<String>,
+) -> Result<String, MiddlewareError> {
+    let (schema_name, relation_name) = split_object_name(obj_name)?;
+    let schema_expr = sql_string_literal(schema_name.as_deref().unwrap_or("public"));
+    let relation_expr = sql_string_literal(&relation_name);
+    let relation_label = sql_string_literal(&relation_name);
+
+    warnings.push("rewrote MySQL SHOW CREATE TABLE to PostgreSQL catalog query".to_string());
+
+    Ok(format!(
+        "WITH target AS ( \
+             SELECT c.oid, n.nspname AS schema_name, c.relname AS table_name \
+             FROM pg_class c \
+             JOIN pg_namespace n ON n.oid = c.relnamespace \
+             WHERE n.nspname = {schema_expr} AND c.relname = {relation_expr} AND c.relkind IN ('r','p') \
+         ), pieces AS ( \
+             SELECT a.attnum AS ord, \
+                    format('  %I %s%s%s%s', \
+                        a.attname, \
+                        pg_catalog.format_type(a.atttypid, a.atttypmod), \
+                        CASE a.attidentity WHEN 'a' THEN ' GENERATED ALWAYS AS IDENTITY' WHEN 'd' THEN ' GENERATED BY DEFAULT AS IDENTITY' ELSE '' END, \
+                        CASE WHEN a.attnotnull THEN ' NOT NULL' ELSE '' END, \
+                        CASE WHEN ad.adbin IS NOT NULL AND a.attidentity = '' THEN ' DEFAULT ' || pg_get_expr(ad.adbin, ad.adrelid) ELSE '' END \
+                    ) AS line \
+             FROM target t \
+             JOIN pg_attribute a ON a.attrelid = t.oid \
+             LEFT JOIN pg_attrdef ad ON ad.adrelid = a.attrelid AND ad.adnum = a.attnum \
+             WHERE a.attnum > 0 AND NOT a.attisdropped \
+             UNION ALL \
+             SELECT 100000 + row_number() OVER (ORDER BY con.oid), \
+                    CASE WHEN con.contype = 'p' THEN '  ' || pg_get_constraintdef(con.oid) ELSE format('  CONSTRAINT %I %s', con.conname, pg_get_constraintdef(con.oid)) END \
+             FROM target t \
+             JOIN pg_constraint con ON con.conrelid = t.oid \
+         ) \
+         SELECT {relation_label} AS \"Table\", \
+                format('CREATE TABLE %I (\\n%s\\n)', (SELECT table_name FROM target), string_agg(line, E',\\n' ORDER BY ord)) AS \"Create Table\" \
+         FROM pieces"
+    ))
+}
+
+fn translate_show_create_view(
+    obj_name: &ObjectName,
+    warnings: &mut Vec<String>,
+) -> Result<String, MiddlewareError> {
+    let (schema_name, relation_name) = split_object_name(obj_name)?;
+    let schema_expr = sql_string_literal(schema_name.as_deref().unwrap_or("public"));
+    let relation_expr = sql_string_literal(&relation_name);
+    let relation_label = sql_string_literal(&relation_name);
+
+    warnings.push("rewrote MySQL SHOW CREATE VIEW to PostgreSQL catalog query".to_string());
+    Ok(format!(
+        "SELECT {relation_label} AS \"View\", format('CREATE VIEW %I AS %s', c.relname, pg_get_viewdef(c.oid, true)) AS \"Create View\" \
+         FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
+         WHERE n.nspname = {schema_expr} AND c.relname = {relation_expr} AND c.relkind = 'v'"
+    ))
 }
 
 fn split_object_name(table_name: &ObjectName) -> Result<(Option<String>, String), MiddlewareError> {
@@ -281,6 +641,56 @@ fn split_object_name(table_name: &ObjectName) -> Result<(Option<String>, String)
 
 fn sql_string_literal(value: &str) -> String {
     format!("'{}'", value.replace('\'', "''"))
+}
+
+fn extract_show_filter(show_options: &ShowStatementOptions) -> Option<&ShowStatementFilter> {
+    match &show_options.filter_position {
+        Some(ShowStatementFilterPosition::Infix(filter)) | Some(ShowStatementFilterPosition::Suffix(filter)) => Some(filter),
+        None => None,
+    }
+}
+
+fn apply_wrapped_show_filter(
+    base_query: &str,
+    filter: Option<&ShowStatementFilter>,
+    like_field: &str,
+) -> Result<String, MiddlewareError> {
+    let Some(filter) = filter else {
+        return Ok(base_query.to_string());
+    };
+
+    let predicate = match filter {
+        ShowStatementFilter::Like(pattern)
+        | ShowStatementFilter::ILike(pattern)
+        | ShowStatementFilter::NoKeyword(pattern) => format!(
+            "\"{like_field}\" LIKE '{}'",
+            pattern.replace('\'', "''")
+        ),
+        ShowStatementFilter::Where(expr) => expr.to_string(),
+    };
+
+    Ok(format!("SELECT * FROM ({base_query}) AS show_meta WHERE {predicate}"))
+}
+
+fn translate_named_filter(
+    filter: Option<&ShowStatementFilter>,
+    field_name: &str,
+) -> Result<Option<String>, MiddlewareError> {
+    let Some(filter) = filter else {
+        return Ok(None);
+    };
+
+    match filter {
+        ShowStatementFilter::Like(pattern)
+        | ShowStatementFilter::ILike(pattern)
+        | ShowStatementFilter::NoKeyword(pattern) => Ok(Some(format!(
+            "{field_name} LIKE '{}'",
+            pattern.replace('\'', "''")
+        ))),
+        ShowStatementFilter::Where(_) => Err(MiddlewareError::Translation(
+            "SHOW ... WHERE is not supported yet".to_string(),
+        )),
+    }
 }
 
 fn translate_create_table(

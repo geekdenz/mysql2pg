@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 use serde::Serialize;
-use tokio_postgres::{types::Type, NoTls};
+use tokio_postgres::{types::Type, NoTls, SimpleQueryMessage};
 
 use crate::{config::AppConfig, error::MiddlewareError};
 
@@ -57,33 +57,35 @@ impl PostgresExecutor for TokioPostgresExecutor {
             });
         }
 
-        let statement = client
-            .prepare(sql)
-            .await
-            .map_err(|e| MiddlewareError::Execution(format!("failed to prepare translated query: {}", format_pg_error(&e))))?;
-
-        let columns = statement
-            .columns()
-            .iter()
-            .map(|c| c.name().to_string())
-            .collect::<Vec<_>>();
-
-        let rows = client
-            .query(&statement, &[])
+        let messages = client
+            .simple_query(sql)
             .await
             .map_err(|e| MiddlewareError::Execution(format!("query failed: {}", format_pg_error(&e))))?;
 
-        let row_count = rows.len() as u64;
-        let rendered_rows = rows
-            .iter()
-            .map(|row| {
-                row.columns()
-                    .iter()
-                    .enumerate()
-                    .map(|(idx, col)| value_to_string(row, idx, col.type_()))
-                    .collect::<Vec<_>>()
-            })
-            .collect::<Vec<_>>();
+        let mut columns = Vec::new();
+        let mut rendered_rows = Vec::new();
+        for message in messages {
+            match message {
+                SimpleQueryMessage::RowDescription(description) if columns.is_empty() => {
+                    columns = description.iter().map(|column| column.name().to_string()).collect();
+                }
+                SimpleQueryMessage::Row(row) => {
+                    if columns.is_empty() {
+                        columns = row.columns().iter().map(|column| column.name().to_string()).collect();
+                    }
+                    rendered_rows.push(
+                        row.columns()
+                            .iter()
+                            .enumerate()
+                            .map(|(idx, _)| row.get(idx).unwrap_or_default().to_string())
+                            .collect::<Vec<_>>(),
+                    );
+                }
+                _ => {}
+            }
+        }
+
+        let row_count = rendered_rows.len() as u64;
 
         Ok(QueryResult {
             columns,
@@ -122,6 +124,7 @@ fn format_pg_error(err: &tokio_postgres::Error) -> String {
     err.to_string()
 }
 
+#[allow(dead_code)]
 fn value_to_string(row: &tokio_postgres::Row, idx: usize, ty: &Type) -> String {
     match *ty {
         Type::BOOL => row.try_get::<usize, Option<bool>>(idx).ok().flatten().map(|v| v.to_string()).unwrap_or_default(),

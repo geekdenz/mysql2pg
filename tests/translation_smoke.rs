@@ -75,3 +75,67 @@ fn describe_table_translation_smoke() {
     assert!(result.translated_sql.contains("AS \"Extra\""));
     assert!(result.translated_sql.contains("WHERE c.table_schema = 'public' AND c.table_name = 'order_details'"));
 }
+
+#[test]
+fn show_databases_translation_smoke() {
+    let result = translate_sql("SHOW DATABASES LIKE 'ap%'", &TranslatorConfig::default()).unwrap();
+    assert!(result.translated_sql.contains("FROM pg_database"));
+    assert!(result.translated_sql.contains("datistemplate = FALSE"));
+    assert!(result.translated_sql.contains("datname LIKE 'ap%'"));
+    assert!(result.translated_sql.contains("AS \"Database\""));
+}
+
+#[test]
+fn show_columns_translation_smoke() {
+    let result = translate_sql("SHOW COLUMNS FROM order_details LIKE 'order%'", &TranslatorConfig::default()).unwrap();
+    assert!(result.translated_sql.contains("AS \"Field\""));
+    assert!(result.translated_sql.contains("c.table_name = 'order_details'"));
+    assert!(result.translated_sql.contains("c.column_name LIKE 'order%'"));
+}
+
+#[test]
+fn show_create_table_translation_smoke() {
+    let result = translate_sql("SHOW CREATE TABLE order_details", &TranslatorConfig::default()).unwrap();
+    assert!(result.translated_sql.contains("AS \"Create Table\""));
+    assert!(result.translated_sql.contains("pg_constraint"));
+    assert!(result.translated_sql.contains("CREATE TABLE %I"));
+}
+
+#[test]
+fn show_variables_translation_smoke() {
+    let result = translate_sql("SHOW VARIABLES LIKE 'version%'", &TranslatorConfig::default()).unwrap();
+    assert!(result.translated_sql.contains("\"Variable_name\""));
+    assert!(result.translated_sql.contains("\"Value\""));
+    assert!(result.translated_sql.contains("version_comment"));
+    assert!(result.translated_sql.contains("\"Variable_name\" LIKE 'version%'"));
+}
+
+#[test]
+fn show_status_translation_smoke() {
+    let result = translate_sql("SHOW STATUS LIKE 'Threads%'", &TranslatorConfig::default()).unwrap();
+    assert!(result.translated_sql.contains("pg_stat_activity"));
+    assert!(result.translated_sql.contains("\"Variable_name\" LIKE 'Threads%'"));
+}
+
+#[test]
+fn show_collation_translation_smoke() {
+    let result = translate_sql("SHOW COLLATION LIKE 'utf8%'", &TranslatorConfig::default()).unwrap();
+    assert!(result.translated_sql.contains("utf8mb4_unicode_ci"));
+    assert!(result.translated_sql.contains("collation_rows(\"Collation\""));
+    assert!(result.translated_sql.contains("\"Collation\" LIKE 'utf8%'"));
+}
+
+#[test]
+fn show_charset_translation_smoke() {
+    let result = translate_sql("SHOW CHARSET LIKE 'utf8%'", &TranslatorConfig::default()).unwrap();
+    assert!(result.translated_sql.contains("utf8mb4"));
+    assert!(result.translated_sql.contains("AS charset_rows"));
+    assert!(result.translated_sql.contains("\"Charset\" LIKE 'utf8%'"));
+}
+
+#[test]
+fn show_views_translation_smoke() {
+    let result = translate_sql("SHOW VIEWS", &TranslatorConfig::default()).unwrap();
+    assert!(result.translated_sql.contains("FROM information_schema.views"));
+    assert!(result.translated_sql.contains("AS \"Tables_in_current_schema\""));
+}
