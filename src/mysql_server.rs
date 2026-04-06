@@ -12,7 +12,7 @@ use tokio::{io::split, net::TcpListener};
 use crate::{
     config::AppConfig,
     error::MiddlewareError,
-    executor::{PostgresExecutor, QueryResult},
+    executor::{PgParam, PostgresExecutor, QueryResult},
     parser::parse_mysql_sql,
     translator::{translate_sql, TranslationResult},
 };
@@ -96,7 +96,7 @@ pub async fn serve_mysql(factory: MySqlFrontendFactory, bind_addr: String) -> an
 
 struct PreparedStatement {
     original_sql: String,
-    translated_sql: String,
+    postgres_sql: String,
     params: Vec<Column>,
     columns: Vec<Column>,
     canned_rows: Option<(Vec<String>, Vec<Vec<String>>)>,
@@ -153,7 +153,8 @@ where
                 return Ok(());
             }
         };
-        tracing::info!("mysql prepare translated: {}", translated);
+        let postgres_sql = rewrite_prepare_placeholders_for_postgres(&translated)?;
+        tracing::info!("mysql prepare translated: {}", postgres_sql);
         let canned_rows = canned_response_for_query(query);
         let statement_id = self.next_statement_id;
         self.next_statement_id += 1;
@@ -168,7 +169,7 @@ where
             statement_id,
             PreparedStatement {
                 original_sql: query.to_string(),
-                translated_sql: translated,
+                postgres_sql,
                 params,
                 columns,
                 canned_rows,
@@ -199,17 +200,26 @@ where
             return write_canned_result(results, columns, rows).await;
         }
 
-        let rendered_sql = match render_prepared_sql(&statement.translated_sql, params) {
-            Ok(sql) => sql,
+        let bound_params = match decode_mysql_params(params) {
+            Ok(params) => params,
             Err(err) => {
-                tracing::warn!("mysql execute render failed for stmt_id={id}: {}", err);
+                tracing::warn!("mysql execute bind decode failed for stmt_id={id}: {}", err);
                 results.error(ErrorKind::ER_PARSE_ERROR, err.to_string().as_bytes()).await?;
                 return Ok(());
             }
         };
-        tracing::info!("mysql execute rendered: {}", rendered_sql);
+        if statement.params.len() != bound_params.len() {
+            let msg = format!(
+                "prepared statement parameter count mismatch: expected {}, got {}",
+                statement.params.len(),
+                bound_params.len()
+            );
+            results.error(ErrorKind::ER_PARSE_ERROR, msg.as_bytes()).await?;
+            return Ok(());
+        }
+        tracing::info!("mysql execute postgres_sql: {}", statement.postgres_sql);
 
-        match self.executor.execute_sql(&rendered_sql).await {
+        match self.executor.execute_prepared_sql(&statement.postgres_sql, &bound_params).await {
             Ok(mut query_result) => {
                 if !statement.columns.is_empty() && !query_result.columns.is_empty() {
                     query_result.columns = statement
@@ -222,7 +232,11 @@ where
             }
             Err(err) => {
                 if let Some(query_result) =
-                    compat_empty_result_for_missing_matomo_option(&statement.original_sql, &rendered_sql, &err)
+                    compat_empty_result_for_missing_matomo_option(
+                        &statement.original_sql,
+                        &statement.postgres_sql,
+                        &err,
+                    )
                 {
                     return write_query_result(results, query_result).await;
                 }
@@ -428,33 +442,8 @@ fn canned_response_for_query(query: &str) -> Option<(Vec<String>, Vec<Vec<String
     None
 }
 
-fn render_prepared_sql(sql: &str, params: ParamParser<'_>) -> Result<String, MiddlewareError> {
-    let rendered_params = params
-        .into_iter()
-        .map(render_param_value)
-        .collect::<Result<Vec<_>, _>>()?;
-
-    let expected = count_prepare_placeholders(sql);
-    if expected != rendered_params.len() {
-        return Err(MiddlewareError::Execution(format!(
-            "prepared statement parameter count mismatch: expected {expected}, got {}",
-            rendered_params.len()
-        )));
-    }
-
-    let mut result = String::with_capacity(sql.len() + rendered_params.len() * 8);
-    let mut params_iter = rendered_params.iter();
-    for ch in sql.chars() {
-        if ch == '?' {
-            let value = params_iter.next().ok_or_else(|| {
-                MiddlewareError::Execution("missing prepared statement parameter".to_string())
-            })?;
-            result.push_str(value);
-        } else {
-            result.push(ch);
-        }
-    }
-    Ok(result)
+fn decode_mysql_params(params: ParamParser<'_>) -> Result<Vec<PgParam>, MiddlewareError> {
+    params.into_iter().map(decode_mysql_param).collect()
 }
 
 fn translate_preparable_sql(
@@ -512,6 +501,33 @@ fn prepare_param_marker(index: usize) -> String {
 
 fn count_prepare_placeholders(sql: &str) -> usize {
     let mut count = 0usize;
+    scan_prepare_placeholders(sql, |_| {
+        count += 1;
+        "?".to_string()
+    });
+    count
+}
+
+fn rewrite_prepare_placeholders_for_postgres(sql: &str) -> Result<String, MiddlewareError> {
+    let rewritten = scan_prepare_placeholders(sql, |index| format!("${index}"));
+    let expected = count_prepare_placeholders(sql);
+    if expected == 0 {
+        return Ok(rewritten);
+    }
+    if !rewritten.contains("$1") {
+        return Err(MiddlewareError::Translation(
+            "failed to rewrite prepared statement placeholders".to_string(),
+        ));
+    }
+    Ok(rewritten)
+}
+
+fn scan_prepare_placeholders(
+    sql: &str,
+    mut replacement: impl FnMut(usize) -> String,
+) -> String {
+    let mut count = 0usize;
+    let mut out = String::with_capacity(sql.len() + 8);
     let mut chars = sql.chars().peekable();
     let mut in_single = false;
     let mut in_double = false;
@@ -521,6 +537,7 @@ fn count_prepare_placeholders(sql: &str) -> usize {
 
     while let Some(ch) = chars.next() {
         if in_line_comment {
+            out.push(ch);
             if ch == '\n' {
                 in_line_comment = false;
             }
@@ -528,16 +545,22 @@ fn count_prepare_placeholders(sql: &str) -> usize {
         }
 
         if in_block_comment {
+            out.push(ch);
             if ch == '*' && chars.peek() == Some(&'/') {
-                chars.next();
+                if let Some(next) = chars.next() {
+                    out.push(next);
+                }
                 in_block_comment = false;
             }
             continue;
         }
 
         if in_single {
+            out.push(ch);
             if ch == '\\' {
-                chars.next();
+                if let Some(next) = chars.next() {
+                    out.push(next);
+                }
                 continue;
             }
             if ch == '\'' {
@@ -547,8 +570,11 @@ fn count_prepare_placeholders(sql: &str) -> usize {
         }
 
         if in_double {
+            out.push(ch);
             if ch == '\\' {
-                chars.next();
+                if let Some(next) = chars.next() {
+                    out.push(next);
+                }
                 continue;
             }
             if ch == '"' {
@@ -558,6 +584,7 @@ fn count_prepare_placeholders(sql: &str) -> usize {
         }
 
         if in_backtick {
+            out.push(ch);
             if ch == '`' {
                 in_backtick = false;
             }
@@ -565,32 +592,54 @@ fn count_prepare_placeholders(sql: &str) -> usize {
         }
 
         match ch {
-            '\'' => in_single = true,
-            '"' => in_double = true,
-            '`' => in_backtick = true,
+            '\'' => {
+                in_single = true;
+                out.push(ch);
+                continue;
+            }
+            '"' => {
+                in_double = true;
+                out.push(ch);
+                continue;
+            }
+            '`' => {
+                in_backtick = true;
+                out.push(ch);
+                continue;
+            }
             '-' if chars.peek() == Some(&'-') => {
-                chars.next();
+                out.push(ch);
+                if let Some(next) = chars.next() {
+                    out.push(next);
+                }
                 in_line_comment = true;
+                continue;
             }
-            '#' => in_line_comment = true,
+            '#' => {
+                out.push(ch);
+                in_line_comment = true;
+                continue;
+            }
             '/' if chars.peek() == Some(&'*') => {
-                chars.next();
+                out.push(ch);
+                if let Some(next) = chars.next() {
+                    out.push(next);
+                }
                 in_block_comment = true;
+                continue;
             }
-            '?' => count += 1,
+            '?' => {
+                count += 1;
+                out.push_str(&replacement(count));
+                continue;
+            }
             _ => {}
         }
+
+        out.push(ch);
     }
 
-    count
-}
-
-fn render_sql_with_nulls(sql: &str, param_count: usize) -> String {
-    let mut rendered = sql.to_string();
-    for _ in 0..param_count {
-        rendered = rendered.replacen('?', "NULL", 1);
-    }
-    rendered
+    out
 }
 
 #[cfg(test)]
@@ -623,25 +672,37 @@ mod tests {
         let sql = "SELECT '?', col FROM t WHERE a = ? AND b = \"?\" /* ? */ -- ?\n AND c = ?";
         assert_eq!(count_prepare_placeholders(sql), 2);
     }
-}
 
-fn render_param_value(param: opensrv_mysql::ParamValue<'_>) -> Result<String, MiddlewareError> {
-    match param.value.into_inner() {
-        ValueInner::NULL => Ok("NULL".to_string()),
-        ValueInner::Bytes(bytes) => Ok(sql_string_literal(std::str::from_utf8(bytes).map_err(|_| {
-            MiddlewareError::Execution("binary prepared statement parameters are not supported yet".to_string())
-        })?)),
-        ValueInner::Int(v) => Ok(v.to_string()),
-        ValueInner::UInt(v) => Ok(v.to_string()),
-        ValueInner::Double(v) => Ok(v.to_string()),
-        ValueInner::Date(bytes) => Ok(sql_string_literal(&decode_mysql_date_literal(bytes)?)),
-        ValueInner::Datetime(bytes) => Ok(sql_string_literal(&decode_mysql_datetime_literal(bytes)?)),
-        ValueInner::Time(bytes) => Ok(sql_string_literal(&decode_mysql_time_literal(bytes)?)),
+    #[test]
+    fn rewrite_prepare_placeholders_for_postgres_ignores_literals_and_comments() {
+        let sql = "SELECT '?', col FROM t WHERE a = ? AND note = \"?\" /* ? */ -- ?\n AND c = ?";
+        let rewritten = rewrite_prepare_placeholders_for_postgres(sql).unwrap();
+        assert_eq!(
+            rewritten,
+            "SELECT '?', col FROM t WHERE a = $1 AND note = \"?\" /* ? */ -- ?\n AND c = $2"
+        );
+    }
+
+    #[test]
+    fn decode_mysql_time_parameter_to_text() {
+        let rendered = decode_mysql_time_literal(&[0, 1, 0, 0, 0, 2, 3, 4]).unwrap();
+        assert_eq!(rendered, "26:03:04");
     }
 }
 
-fn sql_string_literal(value: &str) -> String {
-    format!("'{}'", value.replace('\'', "''"))
+fn decode_mysql_param(param: opensrv_mysql::ParamValue<'_>) -> Result<PgParam, MiddlewareError> {
+    match param.value.into_inner() {
+        ValueInner::NULL => Ok(PgParam::Null),
+        ValueInner::Bytes(bytes) => Ok(PgParam::Text(std::str::from_utf8(bytes).map_err(|_| {
+            MiddlewareError::Execution("binary prepared statement parameters are not supported yet".to_string())
+        })?.to_string())),
+        ValueInner::Int(v) => Ok(PgParam::Text(v.to_string())),
+        ValueInner::UInt(v) => Ok(PgParam::Text(v.to_string())),
+        ValueInner::Double(v) => Ok(PgParam::Text(v.to_string())),
+        ValueInner::Date(bytes) => Ok(PgParam::Text(decode_mysql_date_literal(bytes)?)),
+        ValueInner::Datetime(bytes) => Ok(PgParam::Text(decode_mysql_datetime_literal(bytes)?)),
+        ValueInner::Time(bytes) => Ok(PgParam::Text(decode_mysql_time_literal(bytes)?)),
+    }
 }
 
 fn decode_mysql_date_literal(bytes: &[u8]) -> Result<String, MiddlewareError> {

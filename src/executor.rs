@@ -1,6 +1,10 @@
 use async_trait::async_trait;
 use serde::Serialize;
-use tokio_postgres::{types::Type, NoTls, SimpleQueryMessage};
+use bytes::BytesMut;
+use tokio_postgres::{
+    types::{to_sql_checked, Format, IsNull, ToSql, Type},
+    NoTls, SimpleQueryMessage,
+};
 
 use crate::{config::AppConfig, error::MiddlewareError};
 
@@ -11,9 +15,20 @@ pub struct QueryResult {
     pub row_count: u64,
 }
 
+#[derive(Debug, Clone)]
+pub enum PgParam {
+    Null,
+    Text(String),
+}
+
 #[async_trait]
 pub trait PostgresExecutor: Send + Sync {
     async fn execute_sql(&self, sql: &str) -> Result<QueryResult, MiddlewareError>;
+    async fn execute_prepared_sql(
+        &self,
+        sql: &str,
+        params: &[PgParam],
+    ) -> Result<QueryResult, MiddlewareError>;
     async fn describe_sql(&self, sql: &str) -> Result<Vec<String>, MiddlewareError>;
 }
 
@@ -30,15 +45,7 @@ impl TokioPostgresExecutor {
 #[async_trait]
 impl PostgresExecutor for TokioPostgresExecutor {
     async fn execute_sql(&self, sql: &str) -> Result<QueryResult, MiddlewareError> {
-        let (client, connection) = tokio_postgres::connect(&self.connection_string, NoTls)
-            .await
-            .map_err(|e| MiddlewareError::Execution(format!("failed to connect to PostgreSQL: {}", format_pg_error(&e))))?;
-
-        tokio::spawn(async move {
-            if let Err(err) = connection.await {
-                eprintln!("postgres connection error: {err}");
-            }
-        });
+        let client = connect(&self.connection_string).await?;
 
         let sql_upper = sql.trim_start().to_uppercase();
         let returns_rows = sql_upper.starts_with("SELECT")
@@ -46,7 +53,7 @@ impl PostgresExecutor for TokioPostgresExecutor {
             || sql_upper.starts_with("SHOW")
             || sql_upper.starts_with("VALUES");
 
-        if !returns_rows {
+        let result = if !returns_rows {
             let messages = client
                 .simple_query(sql)
                 .await
@@ -58,60 +65,106 @@ impl PostgresExecutor for TokioPostgresExecutor {
                     _ => None,
                 })
                 .sum();
-            return Ok(QueryResult {
+            Ok(QueryResult {
                 columns: vec![],
                 rows: vec![],
                 row_count: affected,
-            });
-        }
+            })
+        } else {
+            let messages = client
+                .simple_query(sql)
+                .await
+                .map_err(|e| MiddlewareError::Execution(format!("query failed: {}", format_pg_error(&e))))?;
 
-        let messages = client
-            .simple_query(sql)
-            .await
-            .map_err(|e| MiddlewareError::Execution(format!("query failed: {}", format_pg_error(&e))))?;
-
-        let mut columns = Vec::new();
-        let mut rendered_rows = Vec::new();
-        for message in messages {
-            match message {
-                SimpleQueryMessage::RowDescription(description) if columns.is_empty() => {
-                    columns = description.iter().map(|column| column.name().to_string()).collect();
-                }
-                SimpleQueryMessage::Row(row) => {
-                    if columns.is_empty() {
-                        columns = row.columns().iter().map(|column| column.name().to_string()).collect();
+            let mut columns = Vec::new();
+            let mut rendered_rows = Vec::new();
+            for message in messages {
+                match message {
+                    SimpleQueryMessage::RowDescription(description) if columns.is_empty() => {
+                        columns = description.iter().map(|column| column.name().to_string()).collect();
                     }
-                    rendered_rows.push(
-                        row.columns()
-                            .iter()
-                            .enumerate()
-                            .map(|(idx, _)| row.get(idx).unwrap_or_default().to_string())
-                            .collect::<Vec<_>>(),
-                    );
+                    SimpleQueryMessage::Row(row) => {
+                        if columns.is_empty() {
+                            columns = row.columns().iter().map(|column| column.name().to_string()).collect();
+                        }
+                        rendered_rows.push(
+                            row.columns()
+                                .iter()
+                                .enumerate()
+                                .map(|(idx, _)| row.get(idx).unwrap_or_default().to_string())
+                                .collect::<Vec<_>>(),
+                        );
+                    }
+                    _ => {}
                 }
-                _ => {}
             }
-        }
 
-        let row_count = rendered_rows.len() as u64;
+            Ok(QueryResult {
+                row_count: rendered_rows.len() as u64,
+                columns,
+                rows: rendered_rows,
+            })
+        };
 
-        Ok(QueryResult {
-            columns,
-            rows: rendered_rows,
-            row_count,
-        })
+        result
+    }
+
+    async fn execute_prepared_sql(
+        &self,
+        sql: &str,
+        params: &[PgParam],
+    ) -> Result<QueryResult, MiddlewareError> {
+        let client = connect(&self.connection_string).await?;
+        let statement = client
+            .prepare(sql)
+            .await
+            .map_err(|e| MiddlewareError::Execution(format!("statement preparation failed: {}", format_pg_error(&e))))?;
+        let bind_params = params.iter().map(|param| param as &(dyn ToSql + Sync)).collect::<Vec<_>>();
+
+        let result = if statement.columns().is_empty() {
+            let affected = client
+                .execute(&statement, &bind_params)
+                .await
+                .map_err(|e| MiddlewareError::Execution(format!("statement failed: {}", format_pg_error(&e))))?;
+            Ok(QueryResult {
+                columns: Vec::new(),
+                rows: Vec::new(),
+                row_count: affected,
+            })
+        } else {
+            let rows = client
+                .query(&statement, &bind_params)
+                .await
+                .map_err(|e| MiddlewareError::Execution(format!("query failed: {}", format_pg_error(&e))))?;
+            let columns = statement
+                .columns()
+                .iter()
+                .map(|column| column.name().to_string())
+                .collect::<Vec<_>>();
+            let rendered_rows = rows
+                .iter()
+                .map(|row| {
+                    row.columns()
+                        .iter()
+                        .enumerate()
+                        .map(|(idx, column)| value_to_string(row, idx, column.type_()))
+                        .collect::<Vec<_>>()
+                })
+                .collect::<Vec<_>>();
+
+            Ok(QueryResult {
+                row_count: rendered_rows.len() as u64,
+                columns,
+                rows: rendered_rows,
+            })
+        };
+
+        drop(statement);
+        result
     }
 
     async fn describe_sql(&self, sql: &str) -> Result<Vec<String>, MiddlewareError> {
-        let (client, connection) = tokio_postgres::connect(&self.connection_string, NoTls)
-            .await
-            .map_err(|e| MiddlewareError::Execution(format!("failed to connect to PostgreSQL: {}", format_pg_error(&e))))?;
-
-        tokio::spawn(async move {
-            if let Err(err) = connection.await {
-                eprintln!("postgres connection error: {err}");
-            }
-        });
+        let client = connect(&self.connection_string).await?;
 
         let messages = client
             .simple_query(sql)
@@ -132,6 +185,46 @@ impl PostgresExecutor for TokioPostgresExecutor {
 
         Ok(Vec::new())
     }
+}
+
+impl ToSql for PgParam {
+    fn to_sql(
+        &self,
+        _ty: &Type,
+        out: &mut BytesMut,
+    ) -> Result<IsNull, Box<dyn std::error::Error + Sync + Send>> {
+        match self {
+            Self::Null => Ok(IsNull::Yes),
+            Self::Text(value) => {
+                out.extend_from_slice(value.as_bytes());
+                Ok(IsNull::No)
+            }
+        }
+    }
+
+    fn accepts(_ty: &Type) -> bool {
+        true
+    }
+
+    fn encode_format(&self, _ty: &Type) -> Format {
+        Format::Text
+    }
+
+    to_sql_checked!();
+}
+
+async fn connect(connection_string: &str) -> Result<tokio_postgres::Client, MiddlewareError> {
+    let (client, connection) = tokio_postgres::connect(connection_string, NoTls)
+        .await
+        .map_err(|e| MiddlewareError::Execution(format!("failed to connect to PostgreSQL: {}", format_pg_error(&e))))?;
+
+    tokio::spawn(async move {
+        if let Err(err) = connection.await {
+            eprintln!("postgres connection error: {err}");
+        }
+    });
+
+    Ok(client)
 }
 
 fn format_pg_error(err: &tokio_postgres::Error) -> String {
