@@ -156,6 +156,20 @@ That fixture exercises:
 - joins and aggregates
 - metadata commands such as `SHOW TABLES`, `DESC`, `SHOW CREATE TABLE`, and `SHOW VIEWS`
 
+### Run the MariaDB-style compatibility suite
+
+The repository also includes a broader client/server compatibility harness in MariaDB test-suite layout:
+
+```bash
+scripts/run-mariadb-suite.sh
+```
+
+It uses the locally installed `mariadb-test` client against the running middleware and compares output to expected result files stored under [mysql-test/suite/mysql2pg](/home/denz/projects/denz/mysql2pg-middleware/mysql-test/suite/mysql2pg).
+
+Prepared-statement and connector-specific protocol behavior still need a separate test lane; this suite is the first broad SQL/text-protocol filter.
+
+See [docs/mariadb-test-suite.md](/home/denz/projects/denz/mysql2pg-middleware/docs/mariadb-test-suite.md) for scope and workflow.
+
 ## Notes for this iteration
 
 - MySQL frontend now returns MySQL error packets instead of dropping the connection when translation or PostgreSQL execution fails.
