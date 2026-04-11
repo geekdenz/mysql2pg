@@ -161,7 +161,7 @@ where
         let params = (0..param_count)
             .map(|idx| make_param_column(idx + 1))
             .collect::<Vec<_>>();
-        let columns = infer_result_columns(query)
+        let columns = infer_prepare_result_columns(query, &postgres_sql)
             .into_iter()
             .map(|name| make_string_column(&name))
             .collect::<Vec<_>>();
@@ -231,6 +231,11 @@ where
                 write_query_result(results, query_result).await
             }
             Err(err) => {
+                tracing::warn!(
+                    "mysql execute failed stmt_id={id} sql=`{}`: {}",
+                    statement.postgres_sql,
+                    err
+                );
                 if let Some(query_result) =
                     compat_empty_result_for_missing_matomo_option(
                         &statement.original_sql,
@@ -262,6 +267,11 @@ where
         let trimmed = query.trim();
         tracing::info!("mysql query: {}", trimmed);
 
+        if is_compat_noop_query(trimmed) {
+            results.completed(OkResponse::default()).await?;
+            return Ok(());
+        }
+
         if let Some((columns, rows)) = canned_response_for_query(trimmed) {
             write_canned_result(results, &columns, &rows).await?;
             return Ok(());
@@ -281,6 +291,7 @@ where
         match self.executor.execute_sql(&translated).await {
             Ok(query_result) => write_query_result(results, query_result).await,
             Err(err) => {
+                tracing::warn!("mysql query execution failed for `{}`: {}", translated, err);
                 let msg = err.to_string();
                 results.error(ErrorKind::ER_UNKNOWN_ERROR, msg.as_bytes()).await?;
                 Ok(())
@@ -392,6 +403,20 @@ fn infer_result_columns(query: &str) -> Vec<String> {
     }
 }
 
+fn infer_prepare_result_columns(original_sql: &str, translated_sql: &str) -> Vec<String> {
+    let columns = infer_result_columns(original_sql);
+    if !columns.is_empty() {
+        return columns;
+    }
+
+    let translated_columns = infer_result_columns(translated_sql);
+    if translated_columns.iter().any(|name| name == "*") {
+        Vec::new()
+    } else {
+        translated_columns
+    }
+}
+
 fn infer_query_result_columns(query: &Query) -> Vec<String> {
     match query.body.as_ref() {
         SetExpr::Select(select) => select
@@ -421,6 +446,9 @@ fn infer_expr_name(expr: &Expr) -> String {
 
 fn canned_response_for_query(query: &str) -> Option<(Vec<String>, Vec<Vec<String>>)> {
     let normalized = query.trim();
+    if normalized.eq_ignore_ascii_case("SELECT DATABASE()") {
+        return Some((vec!["DATABASE()".to_string()], vec![vec!["app".to_string()]]));
+    }
     if normalized.eq_ignore_ascii_case("SELECT VERSION()") {
         return Some((
             vec!["VERSION()".to_string()],
@@ -440,6 +468,14 @@ fn canned_response_for_query(query: &str) -> Option<(Vec<String>, Vec<Vec<String
         ));
     }
     None
+}
+
+fn is_compat_noop_query(query: &str) -> bool {
+    let normalized = query.trim().to_ascii_uppercase();
+    normalized.starts_with("SET NAMES ")
+        || normalized.starts_with("SET SQL_MODE")
+        || normalized.starts_with("CREATE DATABASE ")
+        || normalized.starts_with("DROP DATABASE ")
 }
 
 fn decode_mysql_params(params: ParamParser<'_>) -> Result<Vec<PgParam>, MiddlewareError> {

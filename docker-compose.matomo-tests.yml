@@ -1,0 +1,61 @@
+services:
+  matomo-tests-postgres:
+    image: postgres:17
+    environment:
+      POSTGRES_DB: ${MATOMO_TESTS_POSTGRES_DB:-app}
+      POSTGRES_USER: ${MATOMO_TESTS_POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${MATOMO_TESTS_POSTGRES_PASSWORD:-postgres}
+    ports:
+      - "${MATOMO_TESTS_POSTGRES_PORT:-5434}:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${MATOMO_TESTS_POSTGRES_USER:-postgres} -d ${MATOMO_TESTS_POSTGRES_DB:-app}"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    volumes:
+      - matomo_tests_postgres_data:/var/lib/postgresql/data
+
+  matomo-tests-middleware:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    environment:
+      MW_SERVER_BIND_ADDR: 0.0.0.0:8080
+      MW_MYSQL_BIND_ADDR: 0.0.0.0:3306
+      MW_POSTGRES_DRIVER: tokio-postgres
+      MW_POSTGRES_CONNECTION_STRING: host=matomo-tests-postgres port=5432 user=${MATOMO_TESTS_POSTGRES_USER:-postgres} password=${MATOMO_TESTS_POSTGRES_PASSWORD:-postgres} dbname=${MATOMO_TESTS_POSTGRES_DB:-app}
+      MW_TRANSLATOR_REWRITE_LIMIT_COMMA: "true"
+      MW_TRANSLATOR_NORMALIZE_MYSQL_BACKTICKS: "true"
+      MW_TRANSLATOR_NORMALIZE_BOOLEAN_LITERALS: "true"
+      MW_TRANSLATOR_REWRITE_MYSQL_FUNCTIONS: "true"
+      MW_TRANSLATOR_REWRITE_JSON_OPERATORS: "true"
+      MW_TRANSLATOR_STRIP_MYSQL_TABLE_OPTIONS: "true"
+      RUST_LOG: ${MATOMO_TESTS_RUST_LOG:-info}
+    ports:
+      - "${MATOMO_TESTS_MIDDLEWARE_HTTP_PORT:-8083}:8080"
+      - "${MATOMO_TESTS_MIDDLEWARE_MYSQL_PORT:-3307}:3306"
+    depends_on:
+      matomo-tests-postgres:
+        condition: service_healthy
+    command: ["mysql2pg-middleware", "--config", "/app/config/example.toml", "serve"]
+
+  matomo-tests-web:
+    build:
+      context: .
+      dockerfile: matomo-tests/Dockerfile
+      args:
+        MATOMO_TESTS_IMAGE_TAG: ${MATOMO_TESTS_IMAGE_TAG:-5.8.0-apache}
+    environment:
+      APACHE_DOCUMENT_ROOT: /var/www/html
+      COMPOSER_ALLOW_SUPERUSER: "1"
+    depends_on:
+      matomo-tests-middleware:
+        condition: service_started
+    ports:
+      - "${MATOMO_TESTS_WEB_PORT:-8084}:80"
+    volumes:
+      - ./tmp/matomo-5.8.0:/var/www/html
+      - ./scripts:/opt/mysql2pg/scripts:ro
+
+volumes:
+  matomo_tests_postgres_data:

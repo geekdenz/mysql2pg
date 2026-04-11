@@ -389,10 +389,9 @@ impl<'a, W: AsyncWrite + Unpin + 'a> RowWriter<'a, W> {
                 .client_capabilities
                 .contains(CapabilityFlags::CLIENT_DEPRECATE_EOF)
             {
-                // response to no column query is always an OK packet
+                // Modern clients expect a real OK packet terminator when EOF is deprecated.
                 let resp = OkResponse {
                     info: extra_info.to_string(),
-                    header: 0xfe,
                     ..Default::default()
                 };
                 self.result.as_mut().unwrap().last_end = Some(Finalizer::Ok(resp));

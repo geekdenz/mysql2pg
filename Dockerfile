@@ -7,7 +7,7 @@ COPY vendor ./vendor
 COPY src ./src
 COPY config ./config
 
-RUN cargo build --release --locked
+RUN cargo build --release --locked -j1
 
 FROM debian:bookworm-slim
 WORKDIR /app

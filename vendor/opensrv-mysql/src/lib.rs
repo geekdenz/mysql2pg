@@ -612,7 +612,7 @@ where
                             } else {
                                 let w = QueryResultWriter::new(
                                     &mut self.writer,
-                                    false,
+                                    true,
                                     self.client_capabilities,
                                 );
                                 self.shim

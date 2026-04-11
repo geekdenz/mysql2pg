@@ -101,11 +101,12 @@ where
     w.write_u16::<LittleEndian>(0)?; // number of warnings
     w.end_packet().await?;
 
+    let prepare_capabilities = client_capabilities & !CapabilityFlags::CLIENT_DEPRECATE_EOF;
     if pi.len() > 0 {
-        write_column_definitions_41(pi, w, client_capabilities, false).await?;
+        write_column_definitions_41(pi, w, prepare_capabilities, false).await?;
     }
     if ci.len() > 0 {
-        write_column_definitions_41(ci, w, client_capabilities, false).await?;
+        write_column_definitions_41(ci, w, prepare_capabilities, false).await?;
     }
     Ok(())
 }
