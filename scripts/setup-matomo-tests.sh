@@ -13,6 +13,11 @@ fi
 
 docker compose -f "${COMPOSE_FILE}" up --build -d
 
+docker compose -f "${COMPOSE_FILE}" exec -T matomo-tests-postgres psql \
+  -U postgres \
+  -d app \
+  -c "DROP SCHEMA IF EXISTS public CASCADE; CREATE SCHEMA public;"
+
 docker compose -f "${COMPOSE_FILE}" exec -T matomo-tests-web bash -lc \
   "composer install --no-interaction --prefer-dist"
 
