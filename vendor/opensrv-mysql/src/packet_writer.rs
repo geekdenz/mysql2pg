@@ -59,11 +59,18 @@ impl<W: AsyncWrite + Unpin> PacketWriter<W> {
         let builder = &mut self.packet_builder;
         if !builder.is_empty() {
             let raw_packet = builder.take_buffer();
+            let first_byte = raw_packet.first().copied();
 
             // split the rww buffer at the boundary of size U24_MAX
             let chunks = raw_packet.chunks(U24_MAX);
             let mut header = [0; PACKET_HEADER_SIZE];
             for chunk in chunks {
+                eprintln!(
+                    "mysql packet write seq={} len={} first_byte={:?}",
+                    builder.seq(),
+                    chunk.len(),
+                    first_byte
+                );
                 // prepare the header
                 LittleEndian::write_u24(&mut header, chunk.len() as u32);
                 header[3] = builder.seq();

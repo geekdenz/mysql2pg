@@ -309,7 +309,8 @@ where
             | CapabilityFlags::CLIENT_SECURE_CONNECTION
             | CapabilityFlags::CLIENT_PLUGIN_AUTH
             | CapabilityFlags::CLIENT_PLUGIN_AUTH_LENENC_CLIENT_DATA
-            | CapabilityFlags::CLIENT_CONNECT_WITH_DB;
+            | CapabilityFlags::CLIENT_CONNECT_WITH_DB
+            | CapabilityFlags::CLIENT_DEPRECATE_EOF;
 
         #[cfg(feature = "tls")]
         let server_capabilities = if tls_conf.is_some() {
@@ -559,6 +560,16 @@ where
 
         let mut stmts: HashMap<u32, _> = HashMap::new();
         while let Some((seq, packet)) = self.reader.next_async().await? {
+            eprintln!(
+                "mysql packet read seq={} len={} first_byte={:?} payload={:02x?}",
+                seq,
+                packet.len(),
+                packet.first().copied(),
+                packet.as_ref()
+            );
+            if packet.is_empty() {
+                continue;
+            }
             self.writer.set_seq(seq + 1);
             let res = commands::parse(&packet);
             match res {
@@ -652,7 +663,7 @@ where
                                 let params = params::ParamParser::new(params, state);
                                 let w = QueryResultWriter::new(
                                     &mut self.writer,
-                                    false,
+                                    true,
                                     self.client_capabilities,
                                 );
                                 self.shim.on_execute(stmt, params, w).await?;
@@ -729,6 +740,12 @@ where
                 Err(_) => {
                     // if parser err, we need also stay the conn,
                     // because we can not support all command.
+                    eprintln!(
+                        "mysql unsupported command byte={:?} len={} payload={:02x?}",
+                        packet.first().copied(),
+                        packet.len(),
+                        packet.as_ref()
+                    );
                     writers::write_ok_packet(
                         &mut self.writer,
                         self.client_capabilities,

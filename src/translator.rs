@@ -1,11 +1,12 @@
 use regex::{Captures, Regex};
 use serde::Serialize;
 use sqlparser::ast::{
-    ColumnDef, ColumnOption, CreateTable, DataType, ExactNumberInfo, ObjectName, ShowCharset,
-    ShowCreateObject, ShowStatementFilter, ShowStatementFilterPosition, ShowStatementInParentType,
-    ShowStatementOptions, Statement, TableConstraint, TimezoneInfo,
+    ColumnDef, ColumnOption, CreateTable, DataType, ExactNumberInfo, Expr, ObjectName, OnConflict,
+    OnConflictAction, OnInsert, ShowCharset, ShowCreateObject, ShowStatementFilter,
+    ShowStatementFilterPosition, ShowStatementInParentType, ShowStatementOptions, Statement,
+    TableConstraint, TimezoneInfo,
 };
-use sqlparser::ast::table_constraints::IndexConstraint;
+use sqlparser::ast::table_constraints::{IndexConstraint, UniqueConstraint};
 
 use crate::{config::TranslatorConfig, error::MiddlewareError, parser::parse_mysql_sql};
 
@@ -100,6 +101,7 @@ fn translate_statements(
 fn translate_statement(stmt: &Statement, warnings: &mut Vec<String>) -> Result<String, MiddlewareError> {
     match stmt {
         Statement::CreateTable(create) => translate_create_table(create, warnings),
+        Statement::Insert(insert) => translate_insert(insert, warnings),
         Statement::ShowTables {
             terse,
             history,
@@ -147,6 +149,32 @@ fn translate_statement(stmt: &Statement, warnings: &mut Vec<String>) -> Result<S
         Statement::ExplainTable { table_name, .. } => translate_describe_table(table_name, warnings),
         _ => Ok(stmt.to_string()),
     }
+}
+
+fn translate_insert(
+    insert: &sqlparser::ast::Insert,
+    warnings: &mut Vec<String>,
+) -> Result<String, MiddlewareError> {
+    let mut insert = insert.clone();
+
+    if insert.ignore {
+        if insert.on.is_some() {
+            return Err(MiddlewareError::Translation(
+                "MySQL INSERT IGNORE with an additional conflict clause is not supported".to_string(),
+            ));
+        }
+        insert.ignore = false;
+        insert.on = Some(OnInsert::OnConflict(OnConflict {
+            conflict_target: None,
+            action: OnConflictAction::DoNothing,
+        }));
+        warnings.push(
+            "rewrote MySQL INSERT IGNORE to PostgreSQL INSERT ... ON CONFLICT DO NOTHING"
+                .to_string(),
+        );
+    }
+
+    Ok(insert.to_string())
 }
 
 fn translate_describe_table(
@@ -738,6 +766,18 @@ fn translate_create_table(
                     index.name.as_ref().map(|n| n.to_string()).unwrap_or_else(|| "<unnamed>".to_string())
                 ));
             }
+            TableConstraint::Unique(unique) if unique_constraint_requires_post_index(unique) => {
+                post_statements.push(translate_unique_constraint_as_index(unique, &create.name)?);
+                warnings.push(format!(
+                    "rewrote MySQL UNIQUE KEY `{}` with index expressions to a separate PostgreSQL CREATE UNIQUE INDEX statement",
+                    unique
+                        .index_name
+                        .as_ref()
+                        .or(unique.name.as_ref())
+                        .map(|n| n.to_string())
+                        .unwrap_or_else(|| "<unnamed>".to_string())
+                ));
+            }
             _ => rendered_items.push(translate_table_constraint(constraint)?),
         }
     }
@@ -775,7 +815,7 @@ fn translate_table_constraint(constraint: &TableConstraint) -> Result<String, Mi
             let columns = unique
                 .columns
                 .iter()
-                .map(quote_column_name)
+                .map(render_index_column)
                 .collect::<Vec<_>>()
                 .join(", ");
             let nulls_distinct = unique.nulls_distinct.to_string();
@@ -795,7 +835,7 @@ fn translate_table_constraint(constraint: &TableConstraint) -> Result<String, Mi
             let columns = primary_key
                 .columns
                 .iter()
-                .map(quote_column_name)
+                .map(render_index_column)
                 .collect::<Vec<_>>()
                 .join(", ");
             let characteristics = primary_key
@@ -898,12 +938,83 @@ fn translate_inline_index(index: &IndexConstraint, table_name: &ObjectName) -> R
     let columns = index
         .columns
         .iter()
-        .map(quote_column_name)
-        .collect::<Vec<_>>()
+        .map(render_index_for_create_index)
+        .collect::<Result<Vec<_>, _>>()?
         .join(", ");
 
     Ok(format!(
         "CREATE INDEX {} ON {} ({columns})",
+        quote_ident(&index_name),
+        quote_object_name(table_name)
+    ))
+}
+
+fn translate_unique_constraint_as_index(
+    unique: &UniqueConstraint,
+    table_name: &ObjectName,
+) -> Result<String, MiddlewareError> {
+    if !unique.index_options.is_empty() {
+        return Err(MiddlewareError::Translation(format!(
+            "MySQL UNIQUE KEY `{}` with index options is not supported yet",
+            unique
+                .index_name
+                .as_ref()
+                .or(unique.name.as_ref())
+                .map(|n| n.to_string())
+                .unwrap_or_else(|| "<unnamed>".to_string())
+        )));
+    }
+
+    if unique.index_type.is_some() {
+        return Err(MiddlewareError::Translation(format!(
+            "MySQL UNIQUE KEY `{}` USING <index type> is not supported yet",
+            unique
+                .index_name
+                .as_ref()
+                .or(unique.name.as_ref())
+                .map(|n| n.to_string())
+                .unwrap_or_else(|| "<unnamed>".to_string())
+        )));
+    }
+
+    if unique.characteristics.is_some()
+        || !matches!(unique.nulls_distinct, sqlparser::ast::NullsDistinctOption::None)
+    {
+        return Err(MiddlewareError::Translation(format!(
+            "MySQL UNIQUE KEY `{}` with PostgreSQL-specific constraint options is not supported in expression-index rewriting",
+            unique
+                .index_name
+                .as_ref()
+                .or(unique.name.as_ref())
+                .map(|n| n.to_string())
+                .unwrap_or_else(|| "<unnamed>".to_string())
+        )));
+    }
+
+    let table_index_prefix = sanitize_identifier_for_index_name(&object_name_tail(table_name));
+    let index_name = unique
+        .index_name
+        .as_ref()
+        .or(unique.name.as_ref())
+        .map(ToString::to_string)
+        .map(|name| {
+            let sanitized = sanitize_identifier_for_index_name(&name);
+            if sanitized.starts_with(&format!("{table_index_prefix}_")) {
+                sanitized
+            } else {
+                format!("{table_index_prefix}_{sanitized}")
+            }
+        })
+        .unwrap_or_else(|| format!("{table_index_prefix}_uniq_idx"));
+    let columns = unique
+        .columns
+        .iter()
+        .map(render_index_for_create_index)
+        .collect::<Result<Vec<_>, _>>()?
+        .join(", ");
+
+    Ok(format!(
+        "CREATE UNIQUE INDEX {} ON {} ({columns})",
         quote_ident(&index_name),
         quote_object_name(table_name)
     ))
@@ -1009,8 +1120,130 @@ fn quote_ident_name(name: &sqlparser::ast::Ident) -> String {
     quote_ident(&name.value)
 }
 
-fn quote_column_name(name: &sqlparser::ast::IndexColumn) -> String {
-    quote_ident(&name.column.to_string().trim_matches('`').trim_matches('"').to_string())
+fn render_index_column(name: &sqlparser::ast::IndexColumn) -> String {
+    let column = quote_ident(
+        &name
+            .column
+            .expr
+            .to_string()
+            .trim_matches('`')
+            .trim_matches('"')
+            .to_string(),
+    );
+    let order = name
+        .column
+        .options
+        .asc
+        .map(|asc| if asc { " ASC" } else { " DESC" })
+        .unwrap_or_default();
+    let operator_class = name
+        .operator_class
+        .as_ref()
+        .map(|class| format!(" {}", quote_object_name(class)))
+        .unwrap_or_default();
+    format!("{column}{order}{operator_class}")
+}
+
+fn unique_constraint_requires_post_index(unique: &UniqueConstraint) -> bool {
+    unique.columns.iter().any(index_column_uses_expression)
+}
+
+fn index_column_uses_expression(name: &sqlparser::ast::IndexColumn) -> bool {
+    !matches!(name.column.expr, Expr::Identifier(_) | Expr::CompoundIdentifier(_))
+}
+
+fn render_index_for_create_index(
+    name: &sqlparser::ast::IndexColumn,
+) -> Result<String, MiddlewareError> {
+    let (target, is_expression) = render_index_target_expr(&name.column.expr)?;
+    let target = if is_expression {
+        format!("({target})")
+    } else {
+        target
+    };
+    let order = name
+        .column
+        .options
+        .asc
+        .map(|asc| if asc { " ASC" } else { " DESC" })
+        .unwrap_or_default();
+    let operator_class = name
+        .operator_class
+        .as_ref()
+        .map(|class| format!(" {}", quote_object_name(class)))
+        .unwrap_or_default();
+    Ok(format!("{target}{order}{operator_class}"))
+}
+
+fn render_index_target_expr(expr: &Expr) -> Result<(String, bool), MiddlewareError> {
+    match expr {
+        Expr::Identifier(ident) => Ok((quote_ident(&ident.value), false)),
+        Expr::CompoundIdentifier(parts) => Ok((
+            parts
+                .iter()
+                .map(|part| quote_ident(&part.value))
+                .collect::<Vec<_>>()
+                .join("."),
+            false,
+        )),
+        Expr::Function(function) => render_mysql_prefix_index_expr(function),
+        other => Err(MiddlewareError::Translation(format!(
+            "MySQL index expression `{other}` is not supported yet"
+        ))),
+    }
+}
+
+fn render_mysql_prefix_index_expr(
+    function: &sqlparser::ast::Function,
+) -> Result<(String, bool), MiddlewareError> {
+    if function.uses_odbc_syntax
+        || !matches!(function.parameters, sqlparser::ast::FunctionArguments::None)
+        || function.filter.is_some()
+        || function.null_treatment.is_some()
+        || function.over.is_some()
+        || !function.within_group.is_empty()
+    {
+        return Err(MiddlewareError::Translation(format!(
+            "MySQL index expression `{function}` is not supported yet"
+        )));
+    }
+
+    let [name_part] = function.name.0.as_slice() else {
+        return Err(MiddlewareError::Translation(format!(
+            "MySQL index expression `{function}` is not supported yet"
+        )));
+    };
+    let Some(column_ident) = name_part.as_ident() else {
+        return Err(MiddlewareError::Translation(format!(
+            "MySQL index expression `{function}` is not supported yet"
+        )));
+    };
+    let sqlparser::ast::FunctionArguments::List(args) = &function.args else {
+        return Err(MiddlewareError::Translation(format!(
+            "MySQL index expression `{function}` is not supported yet"
+        )));
+    };
+    if args.duplicate_treatment.is_some() || !args.clauses.is_empty() || args.args.len() != 1 {
+        return Err(MiddlewareError::Translation(format!(
+            "MySQL index expression `{function}` is not supported yet"
+        )));
+    }
+    let sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(length_expr)) = &args.args[0] else {
+        return Err(MiddlewareError::Translation(format!(
+            "MySQL index expression `{function}` is not supported yet"
+        )));
+    };
+    let length = length_expr.to_string();
+    if !length.chars().all(|ch| ch.is_ascii_digit()) {
+        return Err(MiddlewareError::Translation(format!(
+            "MySQL index prefix length `{length}` in `{function}` is not supported yet"
+        )));
+    }
+
+    Ok((
+        format!("left({}, {length})", quote_ident(&column_ident.value)),
+        true,
+    ))
 }
 
 fn translate_data_type(

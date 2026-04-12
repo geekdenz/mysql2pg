@@ -128,9 +128,9 @@ where
         w.write_lenenc_str(b"def")?;
         w.write_lenenc_str(b"")?;
         w.write_lenenc_str(c.table.as_bytes())?;
-        w.write_lenenc_str(b"")?;
+        w.write_lenenc_str(c.table.as_bytes())?;
         w.write_lenenc_str(c.column.as_bytes())?;
-        w.write_lenenc_str(b"")?;
+        w.write_lenenc_str(c.column.as_bytes())?;
         w.write_lenenc_int(0xC)?;
         w.write_u16::<LittleEndian>(UTF8_GENERAL_CI)?;
         w.write_u32::<LittleEndian>(1024)?;
@@ -145,10 +145,10 @@ where
         w.end_packet().await?;
     }
 
-    if !client_capabilities.contains(CapabilityFlags::CLIENT_DEPRECATE_EOF) {
-        write_eof_packet(w, StatusFlags::empty()).await
+    if client_capabilities.contains(CapabilityFlags::CLIENT_DEPRECATE_EOF) {
+        write_ok_packet(w, client_capabilities, OkResponse::default()).await
     } else {
-        Ok(())
+        write_eof_packet(w, StatusFlags::empty()).await
     }
 }
 

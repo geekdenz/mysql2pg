@@ -389,14 +389,12 @@ impl<'a, W: AsyncWrite + Unpin + 'a> RowWriter<'a, W> {
                 .client_capabilities
                 .contains(CapabilityFlags::CLIENT_DEPRECATE_EOF)
             {
-                // Modern clients expect a real OK packet terminator when EOF is deprecated.
                 let resp = OkResponse {
                     info: extra_info.to_string(),
                     ..Default::default()
                 };
                 self.result.as_mut().unwrap().last_end = Some(Finalizer::Ok(resp));
             } else {
-                // we wrote out at least one row
                 self.result.as_mut().unwrap().last_end = Some(Finalizer::Eof);
             }
         }

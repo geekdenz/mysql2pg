@@ -134,10 +134,6 @@ impl<R: AsyncRead + Unpin> PacketReader<R> {
                 match packet(bytes) {
                     Ok((rest, p)) => {
                         self.remaining = rest.len();
-                        if self.remaining > 0 {
-                            self.bytes = rest.to_vec();
-                            self.start = 0;
-                        }
                         return Ok(Some(p));
                     }
                     Err(nom::Err::Incomplete(_)) | Err(nom::Err::Error(_)) => {}
@@ -165,6 +161,7 @@ impl<R: AsyncRead + Unpin> PacketReader<R> {
                 self.r.read(buf).await?
             };
             self.remaining = end + read;
+            self.bytes.truncate(self.remaining);
             // use a larger buffer size to reduce bytes resize times.
             buffer_size = PACKET_LARGE_BUFFER_SIZE;
 

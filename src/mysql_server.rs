@@ -165,6 +165,12 @@ where
             .into_iter()
             .map(|name| make_string_column(&name))
             .collect::<Vec<_>>();
+        tracing::info!(
+            "mysql prepare metadata stmt_id={} params={} columns={}",
+            statement_id,
+            params.len(),
+            columns.len()
+        );
         self.prepared.insert(
             statement_id,
             PreparedStatement {
@@ -219,7 +225,15 @@ where
         }
         tracing::info!("mysql execute postgres_sql: {}", statement.postgres_sql);
 
-        match self.executor.execute_prepared_sql(&statement.postgres_sql, &bound_params).await {
+        let execution = if bound_params.is_empty() && statement.postgres_sql.contains(';') {
+            execute_multi_statement_sql(self.executor.as_ref(), &statement.postgres_sql).await
+        } else {
+            self.executor
+                .execute_prepared_sql(&statement.postgres_sql, &bound_params)
+                .await
+        };
+
+        match execution {
             Ok(mut query_result) => {
                 if !statement.columns.is_empty() && !query_result.columns.is_empty() {
                     query_result.columns = statement
@@ -300,6 +314,24 @@ where
     }
 }
 
+async fn execute_multi_statement_sql(
+    executor: &dyn PostgresExecutor,
+    sql: &str,
+) -> Result<QueryResult, MiddlewareError> {
+    let mut total_row_count = 0u64;
+
+    for statement in sql.split(';').map(str::trim).filter(|part| !part.is_empty()) {
+        let result = executor.execute_sql(statement).await?;
+        total_row_count += result.row_count;
+    }
+
+    Ok(QueryResult {
+        columns: Vec::new(),
+        rows: Vec::new(),
+        row_count: total_row_count,
+    })
+}
+
 async fn write_query_result<W>(
     results: QueryResultWriter<'_, W>,
     query_result: QueryResult,
@@ -373,7 +405,7 @@ fn compat_empty_result_for_missing_matomo_option(
 
 fn make_string_column(name: &str) -> Column {
     Column {
-        table: "".to_string(),
+        table: "result".to_string(),
         column: name.to_string(),
         coltype: ColumnType::MYSQL_TYPE_VAR_STRING,
         colflags: ColumnFlags::empty(),
@@ -404,6 +436,10 @@ fn infer_result_columns(query: &str) -> Vec<String> {
 }
 
 fn infer_prepare_result_columns(original_sql: &str, translated_sql: &str) -> Vec<String> {
+    if let Some(columns) = compat_prepare_columns_for_query(original_sql) {
+        return columns;
+    }
+
     let columns = infer_result_columns(original_sql);
     if !columns.is_empty() {
         return columns;
@@ -415,6 +451,29 @@ fn infer_prepare_result_columns(original_sql: &str, translated_sql: &str) -> Vec
     } else {
         translated_columns
     }
+}
+
+fn compat_prepare_columns_for_query(query: &str) -> Option<Vec<String>> {
+    let normalized = query.trim().to_ascii_uppercase();
+
+    if normalized.starts_with("SHOW VARIABLES") || normalized.starts_with("SHOW STATUS") {
+        return Some(vec!["Variable_name".to_string(), "Value".to_string()]);
+    }
+
+    if normalized.starts_with("SHOW CHARACTER SET") {
+        return Some(vec![
+            "Charset".to_string(),
+            "Description".to_string(),
+            "Default collation".to_string(),
+            "Maxlen".to_string(),
+        ]);
+    }
+
+    if normalized.starts_with("SHOW TABLES") {
+        return Some(vec!["Tables_in_current_schema".to_string()]);
+    }
+
+    None
 }
 
 fn infer_query_result_columns(query: &Query) -> Vec<String> {
@@ -701,6 +760,32 @@ mod tests {
     fn infer_columns_for_simple_select_prepare() {
         let columns = infer_result_columns("SELECT option_value FROM `matomo_option` WHERE option_name = ?");
         assert_eq!(columns, vec!["option_value".to_string()]);
+    }
+
+    #[test]
+    fn infer_columns_for_show_variables_prepare() {
+        let columns = infer_prepare_result_columns(
+            "SHOW VARIABLES LIKE 'character_set_database'",
+            "SELECT * FROM something",
+        );
+        assert_eq!(columns, vec!["Variable_name".to_string(), "Value".to_string()]);
+    }
+
+    #[test]
+    fn infer_columns_for_show_charset_prepare() {
+        let columns = infer_prepare_result_columns(
+            "SHOW CHARACTER SET LIKE 'utf8mb4'",
+            "SELECT * FROM something",
+        );
+        assert_eq!(
+            columns,
+            vec![
+                "Charset".to_string(),
+                "Description".to_string(),
+                "Default collation".to_string(),
+                "Maxlen".to_string()
+            ]
+        );
     }
 
     #[test]
