@@ -19,8 +19,40 @@ pub struct TranslationResult {
 }
 
 pub fn translate_sql(sql: &str, cfg: &TranslatorConfig) -> Result<TranslationResult, MiddlewareError> {
-    let statements = parse_mysql_sql(sql)?;
+    let direct_translation = translate_unparsed_sql(sql)?;
+    let statements = match direct_translation.as_ref() {
+        Some(_) => Vec::new(),
+        None => parse_mysql_sql(sql)?,
+    };
     if statements.is_empty() {
+        if let Some((canonical_mysql_sql, mut translated, mut warnings)) = direct_translation {
+            if cfg.normalize_mysql_backticks {
+                translated = replace_backticks(&translated);
+            }
+            if cfg.rewrite_limit_comma {
+                translated = rewrite_limit_offset_count(&translated, &mut warnings);
+            }
+            if cfg.normalize_boolean_literals {
+                translated = rewrite_boolean_literals(&translated);
+            }
+            if cfg.rewrite_mysql_functions {
+                translated = rewrite_mysql_functions(&translated, &mut warnings);
+            }
+            if cfg.rewrite_json_operators {
+                translated = rewrite_json_extract(&translated, &mut warnings);
+            }
+            if cfg.strip_mysql_table_options {
+                translated = strip_mysql_table_options(&translated, &mut warnings);
+            }
+            translated = quote_reserved_relation_references(&translated, &mut warnings);
+
+            return Ok(TranslationResult {
+                original_sql: sql.to_string(),
+                canonical_mysql_sql,
+                translated_sql: translated,
+                warnings,
+            });
+        }
         return Err(MiddlewareError::Translation("no statements were parsed".to_string()));
     }
 
@@ -52,6 +84,7 @@ pub fn translate_sql(sql: &str, cfg: &TranslatorConfig) -> Result<TranslationRes
     if cfg.strip_mysql_table_options {
         translated = strip_mysql_table_options(&translated, &mut warnings);
     }
+    translated = quote_reserved_relation_references(&translated, &mut warnings);
 
     if requires_unsupported_rejection {
         reject_unsupported(&translated)?;
@@ -63,6 +96,16 @@ pub fn translate_sql(sql: &str, cfg: &TranslatorConfig) -> Result<TranslationRes
         translated_sql: translated,
         warnings,
     })
+}
+
+fn translate_unparsed_sql(
+    sql: &str,
+) -> Result<Option<(String, String, Vec<String>)>, MiddlewareError> {
+    if let Some((translated_sql, warnings)) = translate_show_index_direct(sql)? {
+        return Ok(Some((sql.trim().to_string(), translated_sql, warnings)));
+    }
+
+    Ok(None)
 }
 
 fn statement_requires_unsupported_rejection(stmt: &Statement) -> bool {
@@ -85,6 +128,45 @@ fn statement_requires_unsupported_rejection(stmt: &Statement) -> bool {
 
 fn replace_backticks(sql: &str) -> String {
     sql.replace('`', "\"")
+}
+
+fn quote_reserved_relation_references(sql: &str, warnings: &mut Vec<String>) -> String {
+    let reserved_relations = ["user"];
+    let patterns = [
+        Regex::new(r#"(?i)\b(FROM|JOIN|UPDATE|INTO|TABLE|DELETE\s+FROM|USING|TRUNCATE\s+TABLE|TRUNCATE|LOCK\s+TABLE)\s+([A-Za-z_][A-Za-z0-9_]*)\b"#)
+            .expect("valid relation-reference regex"),
+        Regex::new(r#"(?i)\b(INSERT\s+INTO)\s+([A-Za-z_][A-Za-z0-9_]*)\b"#)
+            .expect("valid insert-into relation regex"),
+    ];
+
+    let mut changed = false;
+    let mut translated = sql.to_string();
+
+    for pattern in patterns {
+        translated = pattern
+            .replace_all(&translated, |caps: &Captures<'_>| {
+                let relation = &caps[2];
+                if reserved_relations
+                    .iter()
+                    .any(|name| relation.eq_ignore_ascii_case(name))
+                {
+                    changed = true;
+                    format!("{} {}", &caps[1], quote_ident(relation))
+                } else {
+                    caps[0].to_string()
+                }
+            })
+            .into_owned();
+    }
+
+    if changed {
+        warnings.push(
+            "quoted reserved relation names in translated SQL to preserve PostgreSQL semantics"
+                .to_string(),
+        );
+    }
+
+    translated
 }
 
 fn translate_statements(
@@ -720,6 +802,69 @@ fn translate_named_filter(
             "SHOW ... WHERE is not supported yet".to_string(),
         )),
     }
+}
+
+fn translate_show_index_direct(sql: &str) -> Result<Option<(String, Vec<String>)>, MiddlewareError> {
+    let pattern = Regex::new(
+        r#"(?is)^\s*SHOW\s+(?:INDEX|INDEXES|KEYS)\s+FROM\s+(?:`([A-Za-z_][A-Za-z0-9_]*)`|([A-Za-z_][A-Za-z0-9_]*))(?:\s+WHERE\s+Key_name\s*=\s*(\?|'.*?'|".*?"))?\s*;?\s*$"#,
+    )
+    .expect("valid show index regex");
+    let Some(caps) = pattern.captures(sql) else {
+        return Ok(None);
+    };
+
+    let table_name = caps
+        .get(1)
+        .or_else(|| caps.get(2))
+        .map(|m| m.as_str())
+        .ok_or_else(|| MiddlewareError::Translation("failed to extract SHOW INDEX table name".to_string()))?;
+    let key_name_filter = caps.get(3).map(|m| m.as_str().trim());
+    let filter_expr = match key_name_filter {
+        Some("?") => "\"Key_name\" = $1".to_string(),
+        Some(value) if (value.starts_with('\'') && value.ends_with('\'')) || (value.starts_with('"') && value.ends_with('"')) => {
+            format!("\"Key_name\" = {}", sql_string_literal(&value[1..value.len() - 1]))
+        }
+        Some(value) => {
+            return Err(MiddlewareError::Translation(format!(
+                "unsupported SHOW INDEX filter value `{value}`"
+            )))
+        }
+        None => "TRUE".to_string(),
+    };
+
+    let translated = format!(
+        "SELECT * FROM ( \
+            SELECT \
+                cls.relname AS \"Table\", \
+                CASE WHEN idx.indisunique THEN 0 ELSE 1 END AS \"Non_unique\", \
+                CASE WHEN idx.indisprimary THEN 'PRIMARY' ELSE ci.relname END AS \"Key_name\", \
+                key_columns.ordinality AS \"Seq_in_index\", \
+                att.attname AS \"Column_name\", \
+                'A' AS \"Collation\", \
+                NULL::BIGINT AS \"Cardinality\", \
+                NULL::BIGINT AS \"Sub_part\", \
+                NULL::TEXT AS \"Packed\", \
+                CASE WHEN att.attnotnull THEN '' ELSE 'YES' END AS \"Null\", \
+                'BTREE' AS \"Index_type\", \
+                '' AS \"Comment\", \
+                '' AS \"Index_comment\", \
+                'YES' AS \"Visible\", \
+                NULL::TEXT AS \"Expression\" \
+            FROM pg_class cls \
+            JOIN pg_namespace ns ON ns.oid = cls.relnamespace \
+            JOIN pg_index idx ON idx.indrelid = cls.oid \
+            JOIN pg_class ci ON ci.oid = idx.indexrelid \
+            JOIN LATERAL unnest(idx.indkey) WITH ORDINALITY AS key_columns(attnum, ordinality) ON TRUE \
+            JOIN pg_attribute att ON att.attrelid = cls.oid AND att.attnum = key_columns.attnum \
+            WHERE ns.nspname = current_schema() AND cls.relname = {} \
+        ) AS show_index_rows WHERE {filter_expr} ORDER BY \"Key_name\", \"Seq_in_index\"",
+        sql_string_literal(table_name),
+    );
+
+    Ok(Some((
+        translated,
+        vec!["translated SHOW INDEX to PostgreSQL catalog query".to_string()],
+    )))
 }
 
 fn translate_create_table(

@@ -161,7 +161,23 @@ where
         let params = (0..param_count)
             .map(|idx| make_param_column(idx + 1))
             .collect::<Vec<_>>();
-        let columns = infer_prepare_result_columns(query, &postgres_sql)
+        let inferred_columns = infer_prepare_result_columns(query, &postgres_sql);
+        let column_names = if inferred_columns.is_empty() || inferred_columns.iter().any(|name| name == "*") {
+            match self.executor.describe_prepared_sql(&postgres_sql).await {
+                Ok(described) => described,
+                Err(err) => {
+                    tracing::warn!(
+                        "mysql prepare describe failed for `{}`: {}",
+                        postgres_sql,
+                        err
+                    );
+                    inferred_columns
+                }
+            }
+        } else {
+            inferred_columns
+        };
+        let columns = column_names
             .into_iter()
             .map(|name| make_string_column(&name))
             .collect::<Vec<_>>();
@@ -471,6 +487,29 @@ fn compat_prepare_columns_for_query(query: &str) -> Option<Vec<String>> {
 
     if normalized.starts_with("SHOW TABLES") {
         return Some(vec!["Tables_in_current_schema".to_string()]);
+    }
+
+    if normalized.starts_with("SHOW INDEX")
+        || normalized.starts_with("SHOW INDEXES")
+        || normalized.starts_with("SHOW KEYS")
+    {
+        return Some(vec![
+            "Table".to_string(),
+            "Non_unique".to_string(),
+            "Key_name".to_string(),
+            "Seq_in_index".to_string(),
+            "Column_name".to_string(),
+            "Collation".to_string(),
+            "Cardinality".to_string(),
+            "Sub_part".to_string(),
+            "Packed".to_string(),
+            "Null".to_string(),
+            "Index_type".to_string(),
+            "Comment".to_string(),
+            "Index_comment".to_string(),
+            "Visible".to_string(),
+            "Expression".to_string(),
+        ]);
     }
 
     None
@@ -784,6 +823,34 @@ mod tests {
                 "Description".to_string(),
                 "Default collation".to_string(),
                 "Maxlen".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn infer_columns_for_show_index_prepare() {
+        let columns = infer_prepare_result_columns(
+            "SHOW INDEX FROM `log_visit` WHERE Key_name = ?",
+            "SELECT * FROM something",
+        );
+        assert_eq!(
+            columns,
+            vec![
+                "Table".to_string(),
+                "Non_unique".to_string(),
+                "Key_name".to_string(),
+                "Seq_in_index".to_string(),
+                "Column_name".to_string(),
+                "Collation".to_string(),
+                "Cardinality".to_string(),
+                "Sub_part".to_string(),
+                "Packed".to_string(),
+                "Null".to_string(),
+                "Index_type".to_string(),
+                "Comment".to_string(),
+                "Index_comment".to_string(),
+                "Visible".to_string(),
+                "Expression".to_string(),
             ]
         );
     }

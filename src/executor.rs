@@ -30,6 +30,7 @@ pub trait PostgresExecutor: Send + Sync {
         params: &[PgParam],
     ) -> Result<QueryResult, MiddlewareError>;
     async fn describe_sql(&self, sql: &str) -> Result<Vec<String>, MiddlewareError>;
+    async fn describe_prepared_sql(&self, sql: &str) -> Result<Vec<String>, MiddlewareError>;
 }
 
 pub struct TokioPostgresExecutor {
@@ -184,6 +185,20 @@ impl PostgresExecutor for TokioPostgresExecutor {
         }
 
         Ok(Vec::new())
+    }
+
+    async fn describe_prepared_sql(&self, sql: &str) -> Result<Vec<String>, MiddlewareError> {
+        let client = connect(&self.connection_string).await?;
+        let statement = client
+            .prepare(sql)
+            .await
+            .map_err(|e| MiddlewareError::Execution(format!("statement description failed: {}", format_pg_error(&e))))?;
+
+        Ok(statement
+            .columns()
+            .iter()
+            .map(|column| column.name().to_string())
+            .collect())
     }
 }
 

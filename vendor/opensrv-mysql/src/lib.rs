@@ -692,6 +692,21 @@ where
                             stmts.remove(&stmt);
                             // NOTE: spec dictates no response from server
                         }
+                        Command::Reset(stmt) => {
+                            let state = stmts.get_mut(&stmt).ok_or_else(|| {
+                                io::Error::new(
+                                    io::ErrorKind::InvalidData,
+                                    format!("asked to reset unknown statement {}", stmt),
+                                )
+                            })?;
+                            state.long_data.clear();
+                            writers::write_ok_packet(
+                                &mut self.writer,
+                                self.client_capabilities,
+                                OkResponse::default(),
+                            )
+                            .await?;
+                        }
                         Command::ListFields(_) => {
                             // mysql_list_fields (CommandByte::COM_FIELD_LIST / 0x04) has been deprecated in mysql 5.7
                             // and will be removed in a future version.

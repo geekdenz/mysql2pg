@@ -88,3 +88,13 @@ fn it_handles_list_fields() {
         Command::ListFields(&b"select @@version_comment limit 1"[..])
     );
 }
+
+#[test]
+fn it_parses_stmt_reset() {
+    let data = &[0x05, 0x00, 0x00, 0x00, 0x1a, 0x2a, 0x00, 0x00, 0x00];
+    let r = Cursor::new(&data[..]);
+    let mut pr = PacketReader::new(r);
+    let (_, p) = pr.next().unwrap().unwrap();
+    let (_, cmd) = parse(&p).unwrap();
+    assert_eq!(cmd, Command::Reset(42));
+}

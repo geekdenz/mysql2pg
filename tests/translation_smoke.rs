@@ -143,10 +143,34 @@ fn show_charset_translation_smoke() {
 }
 
 #[test]
+fn show_index_where_translation_smoke() {
+    let result = translate_sql(
+        "SHOW INDEX FROM `log_visit` WHERE Key_name = ?",
+        &TranslatorConfig::default(),
+    )
+    .unwrap();
+    assert!(result.translated_sql.contains("FROM pg_class cls"));
+    assert!(result.translated_sql.contains("cls.relname = 'log_visit'"));
+    assert!(result.translated_sql.contains("WHERE \"Key_name\" = $1"));
+    assert!(result.translated_sql.contains("AS \"Key_name\""));
+}
+
+#[test]
 fn show_views_translation_smoke() {
     let result = translate_sql("SHOW VIEWS", &TranslatorConfig::default()).unwrap();
     assert!(result.translated_sql.contains("FROM information_schema.views"));
     assert!(result.translated_sql.contains("AS \"Tables_in_current_schema\""));
+}
+
+#[test]
+fn reserved_user_table_is_quoted_in_selects() {
+    let result = translate_sql(
+        "SELECT * FROM user WHERE login = ?",
+        &TranslatorConfig::default(),
+    )
+    .unwrap();
+    assert!(result.translated_sql.contains("FROM \"user\""));
+    assert!(result.translated_sql.contains("WHERE login = ?"));
 }
 
 #[test]

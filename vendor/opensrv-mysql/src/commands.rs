@@ -168,6 +168,7 @@ pub enum Command<'a> {
     Query(&'a [u8]),
     ListFields(&'a [u8]),
     Close(u32),
+    Reset(u32),
     Prepare(&'a [u8]),
     Init(&'a [u8]),
     Execute {
@@ -235,6 +236,13 @@ pub fn parse(i: &[u8]) -> nom::IResult<&[u8], Command<'_>> {
                 nom::number::complete::le_u32,
             ),
             Command::Close,
+        ),
+        map(
+            preceded(
+                tag(&[CommandByte::COM_STMT_RESET as u8]),
+                nom::number::complete::le_u32,
+            ),
+            Command::Reset,
         ),
         map(tag(&[CommandByte::COM_QUIT as u8]), |_| Command::Quit),
         map(tag(&[CommandByte::COM_PING as u8]), |_| Command::Ping),
