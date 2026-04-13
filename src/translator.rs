@@ -101,6 +101,10 @@ pub fn translate_sql(sql: &str, cfg: &TranslatorConfig) -> Result<TranslationRes
 fn translate_unparsed_sql(
     sql: &str,
 ) -> Result<Option<(String, String, Vec<String>)>, MiddlewareError> {
+    if let Some((translated_sql, warnings)) = translate_insert_on_duplicate_key_direct(sql)? {
+        return Ok(Some((sql.trim().to_string(), translated_sql, warnings)));
+    }
+
     if let Some((translated_sql, warnings)) = translate_show_index_direct(sql)? {
         return Ok(Some((sql.trim().to_string(), translated_sql, warnings)));
     }
@@ -865,6 +869,218 @@ fn translate_show_index_direct(sql: &str) -> Result<Option<(String, Vec<String>)
         translated,
         vec!["translated SHOW INDEX to PostgreSQL catalog query".to_string()],
     )))
+}
+
+fn translate_insert_on_duplicate_key_direct(
+    sql: &str,
+) -> Result<Option<(String, Vec<String>)>, MiddlewareError> {
+    let pattern = Regex::new(
+        r#"(?is)^\s*INSERT\s+INTO\s+(?:`([A-Za-z_][A-Za-z0-9_]*)`|([A-Za-z_][A-Za-z0-9_]*))\s*\((.+?)\)\s*VALUES\s*\((.+?)\)\s*ON\s+DUPLICATE\s+KEY\s+UPDATE\s+(.+?)\s*;?\s*$"#,
+    )
+    .expect("valid on duplicate key regex");
+    let Some(caps) = pattern.captures(sql) else {
+        return Ok(None);
+    };
+
+    let table_name = caps
+        .get(1)
+        .or_else(|| caps.get(2))
+        .map(|m| m.as_str())
+        .ok_or_else(|| MiddlewareError::Translation("failed to extract INSERT table name".to_string()))?;
+    let raw_columns = caps
+        .get(3)
+        .map(|m| m.as_str())
+        .ok_or_else(|| MiddlewareError::Translation("failed to extract INSERT columns".to_string()))?;
+    let raw_values = caps
+        .get(4)
+        .map(|m| m.as_str())
+        .ok_or_else(|| MiddlewareError::Translation("failed to extract INSERT values".to_string()))?;
+    let raw_updates = caps
+        .get(5)
+        .map(|m| m.as_str())
+        .ok_or_else(|| MiddlewareError::Translation("failed to extract INSERT updates".to_string()))?;
+
+    let columns = split_sql_csv(raw_columns)?
+        .into_iter()
+        .map(|column| normalize_identifier_token(&column))
+        .collect::<Result<Vec<_>, _>>()?;
+    let values = split_sql_csv(raw_values)?;
+    if columns.is_empty() || columns.len() != values.len() {
+        return Err(MiddlewareError::Translation(
+            "INSERT ... ON DUPLICATE KEY UPDATE requires matching column and value counts"
+                .to_string(),
+        ));
+    }
+
+    let update_assignments = split_sql_csv(raw_updates)?
+        .into_iter()
+        .map(|assignment| parse_update_assignment(&assignment))
+        .collect::<Result<Vec<_>, _>>()?;
+    if update_assignments.is_empty() {
+        return Err(MiddlewareError::Translation(
+            "INSERT ... ON DUPLICATE KEY UPDATE requires at least one assignment".to_string(),
+        ));
+    }
+
+    let conflict_target = infer_on_conflict_target(table_name, &columns, &update_assignments)?;
+    let rendered_columns = columns
+        .iter()
+        .map(|column| quote_ident(column))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let rendered_values = values.join(", ");
+    let rendered_updates = update_assignments
+        .iter()
+        .map(|(column, value)| format!("{} = {}", quote_ident(column), value))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let rendered_conflict_target = conflict_target
+        .iter()
+        .map(|column| quote_ident(column))
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    let translated = format!(
+        "INSERT INTO {} ({}) VALUES ({}) ON CONFLICT ({}) DO UPDATE SET {}",
+        quote_ident(table_name),
+        rendered_columns,
+        rendered_values,
+        rendered_conflict_target,
+        rendered_updates
+    );
+
+    Ok(Some((
+        translated,
+        vec![format!(
+            "rewrote MySQL ON DUPLICATE KEY UPDATE using inferred PostgreSQL conflict target ({})",
+            conflict_target.join(", ")
+        )],
+    )))
+}
+
+fn split_sql_csv(input: &str) -> Result<Vec<String>, MiddlewareError> {
+    let mut parts = Vec::new();
+    let mut current = String::new();
+    let mut chars = input.chars().peekable();
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut in_backtick = false;
+    let mut depth = 0usize;
+
+    while let Some(ch) = chars.next() {
+        match ch {
+            '\'' if !in_double && !in_backtick => {
+                current.push(ch);
+                if in_single {
+                    if chars.peek() == Some(&'\'') {
+                        if let Some(next) = chars.next() {
+                            current.push(next);
+                        }
+                    } else {
+                        in_single = false;
+                    }
+                } else {
+                    in_single = true;
+                }
+            }
+            '"' if !in_single && !in_backtick => {
+                current.push(ch);
+                in_double = !in_double;
+            }
+            '`' if !in_single && !in_double => {
+                current.push(ch);
+                in_backtick = !in_backtick;
+            }
+            '(' if !in_single && !in_double && !in_backtick => {
+                depth += 1;
+                current.push(ch);
+            }
+            ')' if !in_single && !in_double && !in_backtick => {
+                depth = depth.saturating_sub(1);
+                current.push(ch);
+            }
+            ',' if !in_single && !in_double && !in_backtick && depth == 0 => {
+                let part = current.trim();
+                if part.is_empty() {
+                    return Err(MiddlewareError::Translation(
+                        "unexpected empty CSV segment while translating SQL".to_string(),
+                    ));
+                }
+                parts.push(part.to_string());
+                current.clear();
+            }
+            _ => current.push(ch),
+        }
+    }
+
+    let part = current.trim();
+    if part.is_empty() {
+        return Err(MiddlewareError::Translation(
+            "unexpected empty trailing CSV segment while translating SQL".to_string(),
+        ));
+    }
+    parts.push(part.to_string());
+    Ok(parts)
+}
+
+fn normalize_identifier_token(token: &str) -> Result<String, MiddlewareError> {
+    let trimmed = token.trim();
+    if let Some(identifier) = trimmed.strip_prefix('`').and_then(|value| value.strip_suffix('`')) {
+        return Ok(identifier.to_string());
+    }
+    if let Some(identifier) = trimmed.strip_prefix('"').and_then(|value| value.strip_suffix('"')) {
+        return Ok(identifier.to_string());
+    }
+    if Regex::new(r"^[A-Za-z_][A-Za-z0-9_]*$")
+        .expect("valid identifier regex")
+        .is_match(trimmed)
+    {
+        return Ok(trimmed.to_string());
+    }
+
+    Err(MiddlewareError::Translation(format!(
+        "unsupported identifier token `{trimmed}` in direct SQL translation"
+    )))
+}
+
+fn parse_update_assignment(assignment: &str) -> Result<(String, String), MiddlewareError> {
+    let mut parts = assignment.splitn(2, '=');
+    let left = parts
+        .next()
+        .ok_or_else(|| MiddlewareError::Translation("missing update assignment column".to_string()))?;
+    let right = parts
+        .next()
+        .ok_or_else(|| MiddlewareError::Translation("missing update assignment value".to_string()))?;
+    Ok((normalize_identifier_token(left)?, right.trim().to_string()))
+}
+
+fn infer_on_conflict_target(
+    table_name: &str,
+    columns: &[String],
+    update_assignments: &[(String, String)],
+) -> Result<Vec<String>, MiddlewareError> {
+    if table_name.eq_ignore_ascii_case("user_language")
+        && columns.iter().any(|column| column.eq_ignore_ascii_case("login"))
+    {
+        return Ok(vec!["login".to_string()]);
+    }
+
+    if columns.len() == 1 {
+        return Ok(vec![columns[0].clone()]);
+    }
+
+    if let Some(first_column) = columns.first() {
+        if update_assignments
+            .iter()
+            .all(|(column, _)| !column.eq_ignore_ascii_case(first_column))
+        {
+            return Ok(vec![first_column.clone()]);
+        }
+    }
+
+    Err(MiddlewareError::Translation(
+        "ON DUPLICATE KEY UPDATE needs table/key-specific ON CONFLICT translation".to_string(),
+    ))
 }
 
 fn translate_create_table(

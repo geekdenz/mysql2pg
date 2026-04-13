@@ -7,6 +7,7 @@ COPY --from=composer_bin /usr/bin/composer /usr/local/bin/composer
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends git unzip mariadb-client \
+    && ln -s /var/www/html/tests /var/www/tests \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /var/www/html

@@ -186,6 +186,14 @@ pub trait AsyncMysqlShim<W: Send> {
     where
         W: 'async_trait;
 
+    /// Called when the client resets a prepared statement.
+    async fn on_reset<'a>(&'a mut self, _stmt: u32) -> Result<OkResponse, Self::Error>
+    where
+        W: 'async_trait,
+    {
+        Ok(OkResponse::default())
+    }
+
     /// Called when the client issues a query for immediate execution.
     ///
     /// Results should be returned using the given
@@ -700,10 +708,11 @@ where
                                 )
                             })?;
                             state.long_data.clear();
+                            let ok_packet = self.shim.on_reset(stmt).await?;
                             writers::write_ok_packet(
                                 &mut self.writer,
                                 self.client_capabilities,
-                                OkResponse::default(),
+                                ok_packet,
                             )
                             .await?;
                         }

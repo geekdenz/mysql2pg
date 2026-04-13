@@ -10,10 +10,12 @@ fn select_translation_smoke() {
 }
 
 #[test]
-fn unsupported_mysql_constructs_fail_fast() {
-    let sql = "INSERT INTO users(id, name) VALUES (1, 'a') ON DUPLICATE KEY UPDATE name='b'";
-    let err = translate_sql(sql, &TranslatorConfig::default()).unwrap_err();
-    assert!(err.to_string().contains("ON DUPLICATE KEY UPDATE"));
+fn on_duplicate_key_update_translation_smoke() {
+    let sql = "INSERT INTO user_language (login, language) VALUES (?, ?) ON DUPLICATE KEY UPDATE language = ?";
+    let result = translate_sql(sql, &TranslatorConfig::default()).unwrap();
+    assert!(result
+        .translated_sql
+        .contains("INSERT INTO \"user_language\" (\"login\", \"language\") VALUES (?, ?) ON CONFLICT (\"login\") DO UPDATE SET \"language\" = ?"));
 }
 
 #[test]

@@ -13,6 +13,7 @@ pub struct QueryResult {
     pub columns: Vec<String>,
     pub rows: Vec<Vec<String>>,
     pub row_count: u64,
+    pub last_insert_id: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -55,22 +56,46 @@ impl PostgresExecutor for TokioPostgresExecutor {
             || sql_upper.starts_with("VALUES");
 
         let result = if !returns_rows {
-            let messages = client
-                .simple_query(sql)
-                .await
-                .map_err(|e| MiddlewareError::Execution(format!("statement failed: {}", format_pg_error(&e))))?;
-            let affected = messages
-                .into_iter()
-                .filter_map(|message| match message {
-                    SimpleQueryMessage::CommandComplete(rows) => Some(rows),
-                    _ => None,
+            if let Some((table_name, identity_column)) = find_identity_insert_target(&client, sql).await? {
+                let wrapped_sql = wrap_insert_returning_sql(sql, &identity_column);
+                let row = client
+                    .query_one(&wrapped_sql, &[])
+                    .await
+                    .map_err(|e| MiddlewareError::Execution(format!("statement failed: {}", format_pg_error(&e))))?;
+                let row_count = row.try_get::<usize, i64>(0).unwrap_or_default().max(0) as u64;
+                let last_insert_id = row.try_get::<usize, i64>(1).unwrap_or_default().max(0) as u64;
+                tracing::debug!(
+                    "captured insert id for {}.{} => row_count={} last_insert_id={}",
+                    table_name,
+                    identity_column,
+                    row_count,
+                    last_insert_id
+                );
+                Ok(QueryResult {
+                    columns: vec![],
+                    rows: vec![],
+                    row_count,
+                    last_insert_id,
                 })
-                .sum();
-            Ok(QueryResult {
-                columns: vec![],
-                rows: vec![],
-                row_count: affected,
-            })
+            } else {
+                let messages = client
+                    .simple_query(sql)
+                    .await
+                    .map_err(|e| MiddlewareError::Execution(format!("statement failed: {}", format_pg_error(&e))))?;
+                let affected = messages
+                    .into_iter()
+                    .filter_map(|message| match message {
+                        SimpleQueryMessage::CommandComplete(rows) => Some(rows),
+                        _ => None,
+                    })
+                    .sum();
+                Ok(QueryResult {
+                    columns: vec![],
+                    rows: vec![],
+                    row_count: affected,
+                    last_insert_id: 0,
+                })
+            }
         } else {
             let messages = client
                 .simple_query(sql)
@@ -104,6 +129,7 @@ impl PostgresExecutor for TokioPostgresExecutor {
                 row_count: rendered_rows.len() as u64,
                 columns,
                 rows: rendered_rows,
+                last_insert_id: 0,
             })
         };
 
@@ -123,15 +149,43 @@ impl PostgresExecutor for TokioPostgresExecutor {
         let bind_params = params.iter().map(|param| param as &(dyn ToSql + Sync)).collect::<Vec<_>>();
 
         let result = if statement.columns().is_empty() {
-            let affected = client
-                .execute(&statement, &bind_params)
-                .await
-                .map_err(|e| MiddlewareError::Execution(format!("statement failed: {}", format_pg_error(&e))))?;
-            Ok(QueryResult {
-                columns: Vec::new(),
-                rows: Vec::new(),
-                row_count: affected,
-            })
+            if let Some((table_name, identity_column)) = find_identity_insert_target(&client, sql).await? {
+                let wrapped_sql = wrap_insert_returning_sql(sql, &identity_column);
+                let wrapped_statement = client
+                    .prepare(&wrapped_sql)
+                    .await
+                    .map_err(|e| MiddlewareError::Execution(format!("statement preparation failed: {}", format_pg_error(&e))))?;
+                let row = client
+                    .query_one(&wrapped_statement, &bind_params)
+                    .await
+                    .map_err(|e| MiddlewareError::Execution(format!("statement failed: {}", format_pg_error(&e))))?;
+                let row_count = row.try_get::<usize, i64>(0).unwrap_or_default().max(0) as u64;
+                let last_insert_id = row.try_get::<usize, i64>(1).unwrap_or_default().max(0) as u64;
+                tracing::debug!(
+                    "captured insert id for {}.{} => row_count={} last_insert_id={}",
+                    table_name,
+                    identity_column,
+                    row_count,
+                    last_insert_id
+                );
+                Ok(QueryResult {
+                    columns: Vec::new(),
+                    rows: Vec::new(),
+                    row_count,
+                    last_insert_id,
+                })
+            } else {
+                let affected = client
+                    .execute(&statement, &bind_params)
+                    .await
+                    .map_err(|e| MiddlewareError::Execution(format!("statement failed: {}", format_pg_error(&e))))?;
+                Ok(QueryResult {
+                    columns: Vec::new(),
+                    rows: Vec::new(),
+                    row_count: affected,
+                    last_insert_id: 0,
+                })
+            }
         } else {
             let rows = client
                 .query(&statement, &bind_params)
@@ -157,6 +211,7 @@ impl PostgresExecutor for TokioPostgresExecutor {
                 row_count: rendered_rows.len() as u64,
                 columns,
                 rows: rendered_rows,
+                last_insert_id: 0,
             })
         };
 
@@ -271,6 +326,53 @@ fn format_pg_error(err: &tokio_postgres::Error) -> String {
     err.to_string()
 }
 
+async fn find_identity_insert_target(
+    client: &tokio_postgres::Client,
+    sql: &str,
+) -> Result<Option<(String, String)>, MiddlewareError> {
+    let Some(table_name) = extract_insert_table_name(sql) else {
+        return Ok(None);
+    };
+
+    let row = client
+        .query_opt(
+            "SELECT a.attname \
+             FROM pg_class cls \
+             JOIN pg_namespace ns ON ns.oid = cls.relnamespace \
+             JOIN pg_attribute a ON a.attrelid = cls.oid AND a.attnum > 0 AND NOT a.attisdropped \
+             LEFT JOIN pg_attrdef ad ON ad.adrelid = cls.oid AND ad.adnum = a.attnum \
+             WHERE ns.nspname = current_schema() \
+               AND cls.relname = $1 \
+               AND (a.attidentity IN ('a','d') OR coalesce(pg_get_expr(ad.adbin, ad.adrelid), '') LIKE 'nextval(%') \
+             ORDER BY a.attnum \
+             LIMIT 1",
+            &[&table_name],
+        )
+        .await
+        .map_err(|e| MiddlewareError::Execution(format!("identity column lookup failed: {}", format_pg_error(&e))))?;
+
+    Ok(row.map(|row| (table_name, row.get::<usize, String>(0))))
+}
+
+fn extract_insert_table_name(sql: &str) -> Option<String> {
+    let pattern = regex::Regex::new(
+        r#"(?is)^\s*INSERT\s+INTO\s+(?:"([^"]+)"|([A-Za-z_][A-Za-z0-9_]*))(?:\s|\(|$)"#,
+    )
+    .expect("valid insert table regex");
+    let caps = pattern.captures(sql)?;
+    caps.get(1)
+        .or_else(|| caps.get(2))
+        .map(|m| m.as_str().to_string())
+}
+
+fn wrap_insert_returning_sql(sql: &str, identity_column: &str) -> String {
+    format!(
+        "WITH inserted_rows AS ({sql} RETURNING \"{identity_column}\") \
+         SELECT COUNT(*)::BIGINT AS __mw_row_count__, COALESCE(MAX(\"{identity_column}\"), 0)::BIGINT AS __mw_last_insert_id__ \
+         FROM inserted_rows"
+    )
+}
+
 #[allow(dead_code)]
 fn value_to_string(row: &tokio_postgres::Row, idx: usize, ty: &Type) -> String {
     match *ty {
@@ -309,5 +411,26 @@ pub fn build_executor(cfg: &AppConfig) -> Result<std::sync::Arc<dyn PostgresExec
         other => Err(MiddlewareError::Config(format!(
             "unsupported postgres driver `{other}`; currently supported: tokio-postgres"
         ))),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::extract_insert_table_name;
+
+    #[test]
+    fn extract_insert_table_name_supports_quoted_identifiers() {
+        assert_eq!(
+            extract_insert_table_name(r#"INSERT INTO "site" ("name") VALUES ($1)"#).as_deref(),
+            Some("site")
+        );
+    }
+
+    #[test]
+    fn extract_insert_table_name_supports_unquoted_identifiers() {
+        assert_eq!(
+            extract_insert_table_name("INSERT INTO site (name) VALUES ($1)").as_deref(),
+            Some("site")
+        );
     }
 }

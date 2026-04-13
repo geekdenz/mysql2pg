@@ -64,6 +64,7 @@ impl MySqlFrontendFactory {
             next_statement_id: 1,
             prepared: HashMap::new(),
             current_db: None,
+            last_insert_id: 0,
         }
     }
 }
@@ -108,6 +109,7 @@ struct MySqlBackend {
     next_statement_id: u32,
     prepared: HashMap<u32, PreparedStatement>,
     current_db: Option<String>,
+    last_insert_id: u64,
 }
 
 #[async_trait]
@@ -144,6 +146,35 @@ where
     ) -> Result<(), Self::Error> {
         tracing::info!("mysql prepare: {}", query);
         let param_count = count_prepare_placeholders(query);
+        let is_compat_noop = is_compat_noop_query(query);
+
+        if is_compat_noop {
+            let statement_id = self.next_statement_id;
+            self.next_statement_id += 1;
+            let params = (0..param_count)
+                .map(|idx| make_param_column(idx + 1))
+                .collect::<Vec<_>>();
+            self.prepared.insert(
+                statement_id,
+                PreparedStatement {
+                    original_sql: query.to_string(),
+                    postgres_sql: String::new(),
+                    params,
+                    columns: Vec::new(),
+                    canned_rows: None,
+                },
+            );
+
+            let params: Vec<&Column> = self.prepared[&statement_id].params.iter().collect();
+            let columns: Vec<&Column> = Vec::new();
+            tracing::info!(
+                "mysql prepare metadata stmt_id={} params={} columns=0 (compat noop)",
+                statement_id,
+                params.len()
+            );
+            info.reply(statement_id, params, columns).await?;
+            return Ok(());
+        }
 
         let translated = match translate_preparable_sql(query, &self.config.translator) {
             Ok(result) => result.translated_sql,
@@ -222,6 +253,11 @@ where
             return write_canned_result(results, columns, rows).await;
         }
 
+        if statement.postgres_sql.is_empty() && is_compat_noop_query(&statement.original_sql) {
+            results.completed(OkResponse::default()).await?;
+            return Ok(());
+        }
+
         let bound_params = match decode_mysql_params(params) {
             Ok(params) => params,
             Err(err) => {
@@ -251,6 +287,9 @@ where
 
         match execution {
             Ok(mut query_result) => {
+                if query_result.last_insert_id > 0 {
+                    self.last_insert_id = query_result.last_insert_id;
+                }
                 if !statement.columns.is_empty() && !query_result.columns.is_empty() {
                     query_result.columns = statement
                         .columns
@@ -289,6 +328,16 @@ where
         self.prepared.remove(&stmt);
     }
 
+    async fn on_reset<'a>(&'a mut self, _stmt: u32) -> Result<OkResponse, Self::Error>
+    where
+        W: 'async_trait,
+    {
+        Ok(OkResponse {
+            last_insert_id: self.last_insert_id,
+            ..Default::default()
+        })
+    }
+
     async fn on_query<'a>(
         &'a mut self,
         query: &'a str,
@@ -319,7 +368,12 @@ where
         tracing::info!("mysql query translated: {}", translated);
 
         match self.executor.execute_sql(&translated).await {
-            Ok(query_result) => write_query_result(results, query_result).await,
+            Ok(query_result) => {
+                if query_result.last_insert_id > 0 {
+                    self.last_insert_id = query_result.last_insert_id;
+                }
+                write_query_result(results, query_result).await
+            }
             Err(err) => {
                 tracing::warn!("mysql query execution failed for `{}`: {}", translated, err);
                 let msg = err.to_string();
@@ -345,6 +399,7 @@ async fn execute_multi_statement_sql(
         columns: Vec::new(),
         rows: Vec::new(),
         row_count: total_row_count,
+        last_insert_id: 0,
     })
 }
 
@@ -359,6 +414,7 @@ where
         results
             .completed(OkResponse {
                 affected_rows: query_result.row_count,
+                last_insert_id: query_result.last_insert_id,
                 ..Default::default()
             })
             .await?;
@@ -416,6 +472,7 @@ fn compat_empty_result_for_missing_matomo_option(
         columns,
         rows: Vec::new(),
         row_count: 0,
+        last_insert_id: 0,
     })
 }
 
@@ -565,6 +622,14 @@ fn canned_response_for_query(query: &str) -> Option<(Vec<String>, Vec<Vec<String
             vec![vec!["mysql2pg-middleware".to_string()]],
         ));
     }
+    if normalized.eq_ignore_ascii_case("SELECT @@SESSION.SQL_MODE")
+        || normalized.eq_ignore_ascii_case("SELECT @@SQL_MODE")
+    {
+        return Some((
+            vec![normalized.to_string()],
+            vec![vec!["ANSI".to_string()]],
+        ));
+    }
     None
 }
 
@@ -574,6 +639,44 @@ fn is_compat_noop_query(query: &str) -> bool {
         || normalized.starts_with("SET SQL_MODE")
         || normalized.starts_with("CREATE DATABASE ")
         || normalized.starts_with("DROP DATABASE ")
+        || is_mysql_session_compat_noop(&normalized)
+}
+
+fn is_mysql_session_compat_noop(normalized_query: &str) -> bool {
+    const PREFIXES: &[&str] = &[
+        "SET WAIT_TIMEOUT",
+        "SET SESSION WAIT_TIMEOUT",
+        "SET @@WAIT_TIMEOUT",
+        "SET @@SESSION.WAIT_TIMEOUT",
+        "SET INTERACTIVE_TIMEOUT",
+        "SET SESSION INTERACTIVE_TIMEOUT",
+        "SET @@INTERACTIVE_TIMEOUT",
+        "SET @@SESSION.INTERACTIVE_TIMEOUT",
+        "SET SESSION GROUP_CONCAT_MAX_LEN",
+        "SET @@SESSION.GROUP_CONCAT_MAX_LEN",
+        "SET @@GROUP_CONCAT_MAX_LEN",
+        "SET @@INNODB_LOCK_WAIT_TIMEOUT",
+        "SET @@SESSION.INNODB_LOCK_WAIT_TIMEOUT",
+        "SET SESSION SQL_REQUIRE_PRIMARY_KEY",
+        "SET @@SESSION.SQL_REQUIRE_PRIMARY_KEY",
+        "SET @@SQL_REQUIRE_PRIMARY_KEY",
+        "SET GLOBAL INNODB_FORCE_PRIMARY_KEY",
+        "SET SESSION CHARACTER_SET_CLIENT",
+        "SET SESSION CHARACTER_SET_RESULTS",
+        "SET SESSION COLLATION_CONNECTION",
+        "SET CHARACTER_SET_CLIENT",
+        "SET CHARACTER_SET_RESULTS",
+        "SET COLLATION_CONNECTION",
+        "SET TIME_ZONE",
+        "SET SESSION TIME_ZONE",
+        "SET FOREIGN_KEY_CHECKS",
+        "SET UNIQUE_CHECKS",
+        "SET SQL_NOTES",
+    ];
+
+    PREFIXES
+        .iter()
+        .any(|prefix| normalized_query.starts_with(prefix))
 }
 
 fn decode_mysql_params(params: ParamParser<'_>) -> Result<Vec<PgParam>, MiddlewareError> {
@@ -875,6 +978,20 @@ mod tests {
     fn decode_mysql_time_parameter_to_text() {
         let rendered = decode_mysql_time_literal(&[0, 1, 0, 0, 0, 2, 3, 4]).unwrap();
         assert_eq!(rendered, "26:03:04");
+    }
+
+    #[test]
+    fn mysql_session_compat_noops_cover_wait_timeout() {
+        assert!(is_compat_noop_query("SET wait_timeout=28800"));
+        assert!(is_compat_noop_query("SET SESSION group_concat_max_len=131072"));
+        assert!(is_compat_noop_query("SET @@innodb_lock_wait_timeout = 3"));
+    }
+
+    #[test]
+    fn canned_response_supports_select_session_sql_mode() {
+        let (columns, rows) = canned_response_for_query("SELECT @@SESSION.sql_mode").unwrap();
+        assert_eq!(columns, vec!["SELECT @@SESSION.sql_mode".to_string()]);
+        assert_eq!(rows, vec![vec!["ANSI".to_string()]]);
     }
 }
 
