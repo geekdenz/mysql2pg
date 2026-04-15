@@ -84,7 +84,7 @@ fn describe_table_translation_smoke() {
     assert!(result.translated_sql.contains("AS \"Key\""));
     assert!(result.translated_sql.contains("AS \"Default\""));
     assert!(result.translated_sql.contains("AS \"Extra\""));
-    assert!(result.translated_sql.contains("WHERE c.table_schema = 'public' AND c.table_name = 'order_details'"));
+    assert!(result.translated_sql.contains("WHERE c.table_schema = current_schema() AND c.table_name = 'order_details'"));
 }
 
 #[test]

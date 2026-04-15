@@ -1,4 +1,11 @@
-use std::{collections::HashMap, io, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    io,
+    sync::{
+        atomic::{AtomicU32, Ordering},
+        Arc, LazyLock, Mutex,
+    },
+};
 
 use async_trait::async_trait;
 use opensrv_mysql::{
@@ -63,11 +70,20 @@ impl MySqlFrontendFactory {
             executor: self.executor.clone(),
             next_statement_id: 1,
             prepared: HashMap::new(),
+            connection_id: NEXT_CONNECTION_ID.fetch_add(1, Ordering::Relaxed),
             current_db: None,
             last_insert_id: 0,
+            session_charset: "utf8mb4".to_string(),
+            session_collation: "utf8mb4_general_ci".to_string(),
+            session_sql_mode: "NO_AUTO_VALUE_ON_ZERO".to_string(),
+            transaction_isolation: "REPEATABLE-READ".to_string(),
         }
     }
 }
+
+static NEXT_CONNECTION_ID: AtomicU32 = AtomicU32::new(9);
+static KILLED_CONNECTION_IDS: LazyLock<Mutex<HashSet<u32>>> =
+    LazyLock::new(|| Mutex::new(HashSet::new()));
 
 pub async fn serve_mysql(factory: MySqlFrontendFactory, bind_addr: String) -> anyhow::Result<()> {
     let listener = TcpListener::bind(&bind_addr).await?;
@@ -108,8 +124,13 @@ struct MySqlBackend {
     executor: Arc<dyn PostgresExecutor>,
     next_statement_id: u32,
     prepared: HashMap<u32, PreparedStatement>,
+    connection_id: u32,
     current_db: Option<String>,
     last_insert_id: u64,
+    session_charset: String,
+    session_collation: String,
+    session_sql_mode: String,
+    transaction_isolation: String,
 }
 
 #[async_trait]
@@ -121,6 +142,10 @@ where
 
     fn version(&self) -> String {
         "8.0.0-mysql2pg".to_string()
+    }
+
+    fn connect_id(&self) -> u32 {
+        self.connection_id
     }
 
 
@@ -147,6 +172,33 @@ where
         tracing::info!("mysql prepare: {}", query);
         let param_count = count_prepare_placeholders(query);
         let is_compat_noop = is_compat_noop_query(query);
+
+        if let Some((columns, rows)) = dynamic_canned_response_for_query(
+            self.connection_id,
+            self.current_db.as_deref(),
+            &self.session_collation,
+            &self.session_sql_mode,
+            &self.transaction_isolation,
+            query,
+        ) {
+            let statement_id = self.next_statement_id;
+            self.next_statement_id += 1;
+            self.prepared.insert(
+                statement_id,
+                PreparedStatement {
+                    original_sql: query.to_string(),
+                    postgres_sql: String::new(),
+                    params: Vec::new(),
+                    columns: columns.iter().map(|name| make_string_column(name)).collect(),
+                    canned_rows: Some((columns, rows)),
+                },
+            );
+
+            let params: Vec<&Column> = Vec::new();
+            let columns: Vec<&Column> = self.prepared[&statement_id].columns.iter().collect();
+            info.reply(statement_id, params, columns).await?;
+            return Ok(());
+        }
 
         if is_compat_noop {
             let statement_id = self.next_statement_id;
@@ -194,7 +246,11 @@ where
             .collect::<Vec<_>>();
         let inferred_columns = infer_prepare_result_columns(query, &postgres_sql);
         let column_names = if inferred_columns.is_empty() || inferred_columns.iter().any(|name| name == "*") {
-            match self.executor.describe_prepared_sql(&postgres_sql).await {
+            match self
+                .executor
+                .describe_prepared_sql_in_schema(active_schema_name(self.current_db.as_deref()), &postgres_sql)
+                .await
+            {
                 Ok(described) => described,
                 Err(err) => {
                     tracing::warn!(
@@ -241,21 +297,41 @@ where
         params: ParamParser<'a>,
         results: QueryResultWriter<'a, W>,
     ) -> Result<(), Self::Error> {
+        abort_if_connection_killed(self.connection_id)?;
         let Some(statement) = self.prepared.get(&id) else {
             results
                 .error(ErrorKind::ER_UNKNOWN_STMT_HANDLER, b"unknown prepared statement id")
                 .await?;
             return Ok(());
         };
+        let original_sql = statement.original_sql.clone();
+        let postgres_sql = statement.postgres_sql.clone();
+        let params_len = statement.params.len();
+        let statement_columns = statement.columns.clone();
+        let canned_rows = statement.canned_rows.clone();
         tracing::info!("mysql execute stmt_id={id}");
 
-        if let Some((columns, rows)) = &statement.canned_rows {
+        if let Some((columns, rows)) = &canned_rows {
             return write_canned_result(results, columns, rows).await;
         }
 
-        if statement.postgres_sql.is_empty() && is_compat_noop_query(&statement.original_sql) {
-            results.completed(OkResponse::default()).await?;
-            return Ok(());
+        if postgres_sql.is_empty() {
+            match handle_mysql_session_query(self, &original_sql) {
+                Ok(Some(response)) => {
+                    results.completed(response).await?;
+                    return Ok(());
+                }
+                Ok(None) => {}
+                Err(err) => {
+                    let msg = err.to_string();
+                    results.error(ErrorKind::ER_UNKNOWN_ERROR, msg.as_bytes()).await?;
+                    return Ok(());
+                }
+            }
+            if is_compat_noop_query(&original_sql) {
+                results.completed(OkResponse::default()).await?;
+                return Ok(());
+            }
         }
 
         let bound_params = match decode_mysql_params(params) {
@@ -266,22 +342,31 @@ where
                 return Ok(());
             }
         };
-        if statement.params.len() != bound_params.len() {
+        if params_len != bound_params.len() {
             let msg = format!(
                 "prepared statement parameter count mismatch: expected {}, got {}",
-                statement.params.len(),
+                params_len,
                 bound_params.len()
             );
             results.error(ErrorKind::ER_PARSE_ERROR, msg.as_bytes()).await?;
             return Ok(());
         }
-        tracing::info!("mysql execute postgres_sql: {}", statement.postgres_sql);
+        tracing::info!("mysql execute postgres_sql: {}", postgres_sql);
 
-        let execution = if bound_params.is_empty() && statement.postgres_sql.contains(';') {
-            execute_multi_statement_sql(self.executor.as_ref(), &statement.postgres_sql).await
+        let execution = if bound_params.is_empty() && postgres_sql.contains(';') {
+            execute_multi_statement_sql(
+                self.executor.as_ref(),
+                active_schema_name(self.current_db.as_deref()),
+                &postgres_sql,
+            )
+            .await
         } else {
             self.executor
-                .execute_prepared_sql(&statement.postgres_sql, &bound_params)
+                .execute_prepared_sql_in_schema(
+                    active_schema_name(self.current_db.as_deref()),
+                    &postgres_sql,
+                    &bound_params,
+                )
                 .await
         };
 
@@ -290,9 +375,8 @@ where
                 if query_result.last_insert_id > 0 {
                     self.last_insert_id = query_result.last_insert_id;
                 }
-                if !statement.columns.is_empty() && !query_result.columns.is_empty() {
-                    query_result.columns = statement
-                        .columns
+                if !statement_columns.is_empty() && !query_result.columns.is_empty() {
+                    query_result.columns = statement_columns
                         .iter()
                         .map(|column| column.column.clone())
                         .collect();
@@ -302,13 +386,13 @@ where
             Err(err) => {
                 tracing::warn!(
                     "mysql execute failed stmt_id={id} sql=`{}`: {}",
-                    statement.postgres_sql,
+                    postgres_sql,
                     err
                 );
                 if let Some(query_result) =
                     compat_empty_result_for_missing_matomo_option(
-                        &statement.original_sql,
-                        &statement.postgres_sql,
+                        &original_sql,
+                        &postgres_sql,
                         &err,
                     )
                 {
@@ -343,10 +427,55 @@ where
         query: &'a str,
         results: QueryResultWriter<'a, W>,
     ) -> Result<(), Self::Error> {
+        abort_if_connection_killed(self.connection_id)?;
         let trimmed = query.trim();
         tracing::info!("mysql query: {}", trimmed);
 
+        if let Some(killed_id) = parse_kill_connection_id(trimmed) {
+            kill_connection(killed_id);
+            results.completed(OkResponse::default()).await?;
+            return Ok(());
+        }
+
+        if let Some((columns, rows)) = dynamic_canned_response_for_query(
+            self.connection_id,
+            self.current_db.as_deref(),
+            &self.session_collation,
+            &self.session_sql_mode,
+            &self.transaction_isolation,
+            trimmed,
+        ) {
+            write_canned_result(results, &columns, &rows).await?;
+            return Ok(());
+        }
+
+        match handle_mysql_session_query(self, trimmed) {
+            Ok(Some(response)) => {
+                results.completed(response).await?;
+                return Ok(());
+            }
+            Ok(None) => {}
+            Err(err) => {
+                let msg = err.to_string();
+                results.error(ErrorKind::ER_UNKNOWN_ERROR, msg.as_bytes()).await?;
+                return Ok(());
+            }
+        }
+
         if is_compat_noop_query(trimmed) {
+            if let Some(database_name) = parse_create_database_name(trimmed) {
+                self.executor.create_schema(&database_name).await?;
+                results.completed(OkResponse::default()).await?;
+                return Ok(());
+            }
+            if let Some(database_name) = parse_drop_database_name(trimmed) {
+                self.executor.drop_schema(&database_name).await?;
+                if self.current_db.as_deref() == Some(database_name.as_str()) {
+                    self.current_db = None;
+                }
+                results.completed(OkResponse::default()).await?;
+                return Ok(());
+            }
             results.completed(OkResponse::default()).await?;
             return Ok(());
         }
@@ -367,7 +496,11 @@ where
         };
         tracing::info!("mysql query translated: {}", translated);
 
-        match self.executor.execute_sql(&translated).await {
+        match self
+            .executor
+            .execute_sql_in_schema(active_schema_name(self.current_db.as_deref()), &translated)
+            .await
+        {
             Ok(query_result) => {
                 if query_result.last_insert_id > 0 {
                     self.last_insert_id = query_result.last_insert_id;
@@ -386,12 +519,13 @@ where
 
 async fn execute_multi_statement_sql(
     executor: &dyn PostgresExecutor,
+    schema: Option<&str>,
     sql: &str,
 ) -> Result<QueryResult, MiddlewareError> {
     let mut total_row_count = 0u64;
 
     for statement in sql.split(';').map(str::trim).filter(|part| !part.is_empty()) {
-        let result = executor.execute_sql(statement).await?;
+        let result = executor.execute_sql_in_schema(schema, statement).await?;
         total_row_count += result.row_count;
     }
 
@@ -458,22 +592,40 @@ fn compat_empty_result_for_missing_matomo_option(
     err: &MiddlewareError,
 ) -> Option<QueryResult> {
     let err_text = err.to_string();
-    if !err_text.contains("relation \"matomo_option\" does not exist") {
+    let missing_option_table =
+        err_text.contains("relation \"matomo_option\" does not exist")
+            || err_text.contains("relation \"option\" does not exist");
+    if !missing_option_table {
         return None;
     }
 
     let normalized = rendered_sql.trim_start().to_ascii_uppercase();
-    if !normalized.starts_with("SELECT") || !rendered_sql.contains("\"matomo_option\"") {
+    let targets_option_table =
+        rendered_sql.contains("\"matomo_option\"") || rendered_sql.contains("\"option\"");
+    if !targets_option_table {
         return None;
     }
 
-    let columns = infer_result_columns(original_sql);
-    Some(QueryResult {
-        columns,
-        rows: Vec::new(),
-        row_count: 0,
-        last_insert_id: 0,
-    })
+    if normalized.starts_with("SELECT") {
+        let columns = infer_result_columns(original_sql);
+        return Some(QueryResult {
+            columns,
+            rows: Vec::new(),
+            row_count: 0,
+            last_insert_id: 0,
+        });
+    }
+
+    if normalized.starts_with("DELETE") || normalized.starts_with("UPDATE") {
+        return Some(QueryResult {
+            columns: Vec::new(),
+            rows: Vec::new(),
+            row_count: 0,
+            last_insert_id: 0,
+        });
+    }
+
+    None
 }
 
 fn make_string_column(name: &str) -> Column {
@@ -601,9 +753,6 @@ fn infer_expr_name(expr: &Expr) -> String {
 
 fn canned_response_for_query(query: &str) -> Option<(Vec<String>, Vec<Vec<String>>)> {
     let normalized = query.trim();
-    if normalized.eq_ignore_ascii_case("SELECT DATABASE()") {
-        return Some((vec!["DATABASE()".to_string()], vec![vec!["app".to_string()]]));
-    }
     if normalized.eq_ignore_ascii_case("SELECT VERSION()") {
         return Some((
             vec!["VERSION()".to_string()],
@@ -627,10 +776,177 @@ fn canned_response_for_query(query: &str) -> Option<(Vec<String>, Vec<Vec<String
     {
         return Some((
             vec![normalized.to_string()],
-            vec![vec!["ANSI".to_string()]],
+            vec![vec!["NO_AUTO_VALUE_ON_ZERO".to_string()]],
         ));
     }
     None
+}
+
+fn dynamic_canned_response_for_query(
+    connection_id: u32,
+    current_db: Option<&str>,
+    session_collation: &str,
+    session_sql_mode: &str,
+    transaction_isolation: &str,
+    query: &str,
+) -> Option<(Vec<String>, Vec<Vec<String>>)> {
+    let normalized = query.trim();
+    if normalized.eq_ignore_ascii_case("SELECT CONNECTION_ID()") {
+        return Some((
+            vec!["CONNECTION_ID()".to_string()],
+            vec![vec![connection_id.to_string()]],
+        ));
+    }
+    if normalized.eq_ignore_ascii_case("SELECT DATABASE()") {
+        return Some((
+            vec!["DATABASE()".to_string()],
+            vec![vec![current_db.unwrap_or_default().to_string()]],
+        ));
+    }
+    if normalized.eq_ignore_ascii_case("SELECT @@COLLATION_CONNECTION") {
+        return Some((
+            vec!["@@collation_connection".to_string()],
+            vec![vec![session_collation.to_string()]],
+        ));
+    }
+    if normalized.eq_ignore_ascii_case("SELECT @@SESSION.SQL_MODE")
+        || normalized.eq_ignore_ascii_case("SELECT @@SQL_MODE")
+    {
+        return Some((
+            vec![normalized.to_ascii_lowercase()],
+            vec![vec![session_sql_mode.to_string()]],
+        ));
+    }
+    if normalized.eq_ignore_ascii_case("SELECT @@TRANSACTION_ISOLATION")
+        || normalized.eq_ignore_ascii_case("SELECT @@SESSION.TRANSACTION_ISOLATION")
+        || normalized.eq_ignore_ascii_case("SELECT @@TX_ISOLATION")
+    {
+        return Some((
+            vec![normalized.to_ascii_lowercase()],
+            vec![vec![transaction_isolation.to_string()]],
+        ));
+    }
+    if normalized.eq_ignore_ascii_case("SHOW GLOBAL VARIABLES LIKE 'T%_ISOLATION'")
+        || normalized.eq_ignore_ascii_case("SHOW GLOBAL VARIABLES LIKE 't%_isolation'")
+    {
+        return Some((
+            vec!["Variable_name".to_string(), "Value".to_string()],
+            vec![vec![
+                "transaction_isolation".to_string(),
+                transaction_isolation.to_string(),
+            ]],
+        ));
+    }
+    None
+}
+
+fn parse_kill_connection_id(query: &str) -> Option<u32> {
+    let trimmed = query.trim().trim_end_matches(';').trim();
+    let upper = trimmed.to_ascii_uppercase();
+    let id = upper.strip_prefix("KILL ")?.trim();
+    id.parse().ok()
+}
+
+fn kill_connection(connection_id: u32) {
+    if let Ok(mut killed) = KILLED_CONNECTION_IDS.lock() {
+        killed.insert(connection_id);
+    }
+}
+
+fn abort_if_connection_killed(connection_id: u32) -> Result<(), MySqlServerError> {
+    let Ok(mut killed) = KILLED_CONNECTION_IDS.lock() else {
+        return Ok(());
+    };
+    if killed.remove(&connection_id) {
+        return Err(MySqlServerError::Io(io::Error::new(
+            io::ErrorKind::ConnectionAborted,
+            "MySQL server has gone away",
+        )));
+    }
+    Ok(())
+}
+
+fn handle_mysql_session_query(
+    backend: &mut MySqlBackend,
+    query: &str,
+) -> Result<Option<OkResponse>, MySqlServerError> {
+    let trimmed = query.trim().trim_end_matches(';').trim();
+    let upper = trimmed.to_ascii_uppercase();
+
+    if upper.starts_with("SET NAMES ") {
+        apply_set_names(backend, trimmed)?;
+        return Ok(Some(OkResponse::default()));
+    }
+
+    if upper.starts_with("SET SESSION TRANSACTION ISOLATION LEVEL ") {
+        let level = trimmed["SET SESSION TRANSACTION ISOLATION LEVEL ".len()..].trim();
+        backend.transaction_isolation = normalize_transaction_isolation(level);
+        return Ok(Some(OkResponse::default()));
+    }
+
+    if upper.starts_with("SET TRANSACTION ISOLATION LEVEL ") {
+        let level = trimmed["SET TRANSACTION ISOLATION LEVEL ".len()..].trim();
+        backend.transaction_isolation = normalize_transaction_isolation(level);
+        return Ok(Some(OkResponse::default()));
+    }
+
+    Ok(None)
+}
+
+fn apply_set_names(backend: &mut MySqlBackend, sql: &str) -> Result<(), MySqlServerError> {
+    let payload = sql["SET NAMES ".len()..].trim();
+    let mut parts = payload.splitn(2, char::is_whitespace);
+    let charset = parts
+        .next()
+        .unwrap_or_default()
+        .trim_matches('\'')
+        .trim_matches('"')
+        .to_ascii_lowercase();
+
+    if !matches!(charset.as_str(), "utf8" | "utf8mb3" | "utf8mb4") {
+        return Err(MySqlServerError::Middleware(MiddlewareError::Execution(format!(
+            "unknown character set: {charset}"
+        ))));
+    }
+
+    let mut collation = None;
+    if let Some(rest) = parts.next() {
+        let rest = rest.trim();
+        if !rest.is_empty() {
+            let upper = rest.to_ascii_uppercase();
+            if let Some(value) = upper.strip_prefix("COLLATE ") {
+                let original = &rest[rest.len() - value.len()..];
+                collation = Some(
+                    original
+                        .trim()
+                        .trim_matches('\'')
+                        .trim_matches('"')
+                        .to_ascii_lowercase(),
+                );
+            }
+        }
+    }
+
+    if let Some(collation) = collation {
+        if !collation.starts_with(&(charset.clone() + "_")) {
+            return Err(MySqlServerError::Middleware(MiddlewareError::Execution(format!(
+                "unknown collation: {collation}"
+            ))));
+        }
+        backend.session_collation = collation;
+    }
+
+    backend.session_charset = charset;
+    Ok(())
+}
+
+fn normalize_transaction_isolation(level: &str) -> String {
+    level
+        .split_whitespace()
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join("-")
+        .to_ascii_uppercase()
 }
 
 fn is_compat_noop_query(query: &str) -> bool {
@@ -640,6 +956,39 @@ fn is_compat_noop_query(query: &str) -> bool {
         || normalized.starts_with("CREATE DATABASE ")
         || normalized.starts_with("DROP DATABASE ")
         || is_mysql_session_compat_noop(&normalized)
+}
+
+fn active_schema_name(current_db: Option<&str>) -> Option<&str> {
+    current_db.filter(|db| !db.trim().is_empty())
+}
+
+fn parse_database_name(sql: &str, prefix: &str) -> Option<String> {
+    let rest = sql.trim().strip_prefix(prefix)?.trim();
+    let rest = rest
+        .strip_prefix("IF NOT EXISTS ")
+        .or_else(|| rest.strip_prefix("IF EXISTS "))
+        .unwrap_or(rest)
+        .trim();
+    let ident = rest
+        .split_whitespace()
+        .next()?
+        .trim_matches(';')
+        .trim_matches('`')
+        .trim_matches('"');
+    if ident.is_empty() {
+        None
+    } else {
+        Some(ident.to_string())
+    }
+}
+
+fn parse_create_database_name(sql: &str) -> Option<String> {
+    parse_database_name(sql, "CREATE DATABASE")
+        .or_else(|| parse_database_name(sql, "create database"))
+}
+
+fn parse_drop_database_name(sql: &str) -> Option<String> {
+    parse_database_name(sql, "DROP DATABASE").or_else(|| parse_database_name(sql, "drop database"))
 }
 
 fn is_mysql_session_compat_noop(normalized_query: &str) -> bool {
@@ -672,6 +1021,8 @@ fn is_mysql_session_compat_noop(normalized_query: &str) -> bool {
         "SET FOREIGN_KEY_CHECKS",
         "SET UNIQUE_CHECKS",
         "SET SQL_NOTES",
+        "SET SESSION TRANSACTION ISOLATION LEVEL",
+        "SET TRANSACTION ISOLATION LEVEL",
     ];
 
     PREFIXES
@@ -991,7 +1342,7 @@ mod tests {
     fn canned_response_supports_select_session_sql_mode() {
         let (columns, rows) = canned_response_for_query("SELECT @@SESSION.sql_mode").unwrap();
         assert_eq!(columns, vec!["SELECT @@SESSION.sql_mode".to_string()]);
-        assert_eq!(rows, vec![vec!["ANSI".to_string()]]);
+        assert_eq!(rows, vec![vec!["NO_AUTO_VALUE_ON_ZERO".to_string()]]);
     }
 }
 

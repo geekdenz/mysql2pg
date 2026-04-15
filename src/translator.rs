@@ -277,7 +277,10 @@ fn translate_describe_like_query(
     warnings: &mut Vec<String>,
 ) -> Result<String, MiddlewareError> {
     let (schema_name, relation_name) = split_object_name(table_name)?;
-    let schema_expr = sql_string_literal(schema_name.as_deref().unwrap_or("public"));
+    let schema_expr = schema_name
+        .as_deref()
+        .map(sql_string_literal)
+        .unwrap_or_else(|| "current_schema()".to_string());
     let relation_expr = sql_string_literal(&relation_name);
 
     let mut sql = format!(
@@ -572,7 +575,7 @@ fn translate_show_variables(
                             ('collation_database', 'utf8mb4_unicode_ci'), \
                             ('lower_case_table_names', '0'), \
                             ('max_allowed_packet', '67108864'), \
-                            ('sql_mode', 'ANSI'), \
+                            ('sql_mode', 'NO_AUTO_VALUE_ON_ZERO'), \
                             ('system_time_zone', current_setting('TimeZone')), \
                             ('time_zone', current_setting('TimeZone')), \
                             ('transaction_isolation', current_setting('transaction_isolation')), \
@@ -1889,6 +1892,32 @@ fn rewrite_mysql_functions(sql: &str, warnings: &mut Vec<String>) -> String {
             let expr = caps.get(1).map(|m| m.as_str().trim()).unwrap_or("");
             format!("TO_TIMESTAMP({expr})")
         }).to_string();
+    }
+
+    let get_lock_re = Regex::new(r"(?i)\bGET_LOCK\s*\(\s*([^,]+?)\s*,\s*([^)]+?)\s*\)").expect("valid regex");
+    if get_lock_re.is_match(&out) {
+        warnings.push("rewrote MySQL GET_LOCK(name, timeout) to PostgreSQL advisory locking".to_string());
+        out = get_lock_re
+            .replace_all(&out, |caps: &Captures| {
+                let name_expr = caps.get(1).map(|m| m.as_str().trim()).unwrap_or("");
+                format!(
+                    "CASE WHEN pg_try_advisory_lock(hashtextextended(CAST({name_expr} AS text), 0)) THEN 1 ELSE 0 END"
+                )
+            })
+            .to_string();
+    }
+
+    let release_lock_re = Regex::new(r"(?i)\bRELEASE_LOCK\s*\(\s*([^)]+?)\s*\)").expect("valid regex");
+    if release_lock_re.is_match(&out) {
+        warnings.push("rewrote MySQL RELEASE_LOCK(name) to PostgreSQL advisory unlock".to_string());
+        out = release_lock_re
+            .replace_all(&out, |caps: &Captures| {
+                let name_expr = caps.get(1).map(|m| m.as_str().trim()).unwrap_or("");
+                format!(
+                    "CASE WHEN pg_advisory_unlock(hashtextextended(CAST({name_expr} AS text), 0)) THEN 1 ELSE 0 END"
+                )
+            })
+            .to_string();
     }
 
     out

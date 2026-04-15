@@ -25,13 +25,36 @@ pub enum PgParam {
 #[async_trait]
 pub trait PostgresExecutor: Send + Sync {
     async fn execute_sql(&self, sql: &str) -> Result<QueryResult, MiddlewareError>;
+    async fn execute_sql_in_schema(
+        &self,
+        schema: Option<&str>,
+        sql: &str,
+    ) -> Result<QueryResult, MiddlewareError>;
     async fn execute_prepared_sql(
         &self,
         sql: &str,
         params: &[PgParam],
     ) -> Result<QueryResult, MiddlewareError>;
+    async fn execute_prepared_sql_in_schema(
+        &self,
+        schema: Option<&str>,
+        sql: &str,
+        params: &[PgParam],
+    ) -> Result<QueryResult, MiddlewareError>;
     async fn describe_sql(&self, sql: &str) -> Result<Vec<String>, MiddlewareError>;
+    async fn describe_sql_in_schema(
+        &self,
+        schema: Option<&str>,
+        sql: &str,
+    ) -> Result<Vec<String>, MiddlewareError>;
     async fn describe_prepared_sql(&self, sql: &str) -> Result<Vec<String>, MiddlewareError>;
+    async fn describe_prepared_sql_in_schema(
+        &self,
+        schema: Option<&str>,
+        sql: &str,
+    ) -> Result<Vec<String>, MiddlewareError>;
+    async fn create_schema(&self, schema: &str) -> Result<(), MiddlewareError>;
+    async fn drop_schema(&self, schema: &str) -> Result<(), MiddlewareError>;
 }
 
 pub struct TokioPostgresExecutor {
@@ -47,7 +70,15 @@ impl TokioPostgresExecutor {
 #[async_trait]
 impl PostgresExecutor for TokioPostgresExecutor {
     async fn execute_sql(&self, sql: &str) -> Result<QueryResult, MiddlewareError> {
-        let client = connect(&self.connection_string).await?;
+        self.execute_sql_in_schema(None, sql).await
+    }
+
+    async fn execute_sql_in_schema(
+        &self,
+        schema: Option<&str>,
+        sql: &str,
+    ) -> Result<QueryResult, MiddlewareError> {
+        let client = connect(&self.connection_string, schema).await?;
 
         let sql_upper = sql.trim_start().to_uppercase();
         let returns_rows = sql_upper.starts_with("SELECT")
@@ -141,7 +172,16 @@ impl PostgresExecutor for TokioPostgresExecutor {
         sql: &str,
         params: &[PgParam],
     ) -> Result<QueryResult, MiddlewareError> {
-        let client = connect(&self.connection_string).await?;
+        self.execute_prepared_sql_in_schema(None, sql, params).await
+    }
+
+    async fn execute_prepared_sql_in_schema(
+        &self,
+        schema: Option<&str>,
+        sql: &str,
+        params: &[PgParam],
+    ) -> Result<QueryResult, MiddlewareError> {
+        let client = connect(&self.connection_string, schema).await?;
         let statement = client
             .prepare(sql)
             .await
@@ -220,7 +260,15 @@ impl PostgresExecutor for TokioPostgresExecutor {
     }
 
     async fn describe_sql(&self, sql: &str) -> Result<Vec<String>, MiddlewareError> {
-        let client = connect(&self.connection_string).await?;
+        self.describe_sql_in_schema(None, sql).await
+    }
+
+    async fn describe_sql_in_schema(
+        &self,
+        schema: Option<&str>,
+        sql: &str,
+    ) -> Result<Vec<String>, MiddlewareError> {
+        let client = connect(&self.connection_string, schema).await?;
 
         let messages = client
             .simple_query(sql)
@@ -243,7 +291,15 @@ impl PostgresExecutor for TokioPostgresExecutor {
     }
 
     async fn describe_prepared_sql(&self, sql: &str) -> Result<Vec<String>, MiddlewareError> {
-        let client = connect(&self.connection_string).await?;
+        self.describe_prepared_sql_in_schema(None, sql).await
+    }
+
+    async fn describe_prepared_sql_in_schema(
+        &self,
+        schema: Option<&str>,
+        sql: &str,
+    ) -> Result<Vec<String>, MiddlewareError> {
+        let client = connect(&self.connection_string, schema).await?;
         let statement = client
             .prepare(sql)
             .await
@@ -254,6 +310,26 @@ impl PostgresExecutor for TokioPostgresExecutor {
             .iter()
             .map(|column| column.name().to_string())
             .collect())
+    }
+
+    async fn create_schema(&self, schema: &str) -> Result<(), MiddlewareError> {
+        let client = connect(&self.connection_string, None).await?;
+        let sql = format!("CREATE SCHEMA IF NOT EXISTS {}", quote_ident(schema));
+        client
+            .batch_execute(&sql)
+            .await
+            .map_err(|e| MiddlewareError::Execution(format!("schema creation failed: {}", format_pg_error(&e))))?;
+        Ok(())
+    }
+
+    async fn drop_schema(&self, schema: &str) -> Result<(), MiddlewareError> {
+        let client = connect(&self.connection_string, None).await?;
+        let sql = format!("DROP SCHEMA IF EXISTS {} CASCADE", quote_ident(schema));
+        client
+            .batch_execute(&sql)
+            .await
+            .map_err(|e| MiddlewareError::Execution(format!("schema drop failed: {}", format_pg_error(&e))))?;
+        Ok(())
     }
 }
 
@@ -283,7 +359,10 @@ impl ToSql for PgParam {
     to_sql_checked!();
 }
 
-async fn connect(connection_string: &str) -> Result<tokio_postgres::Client, MiddlewareError> {
+async fn connect(
+    connection_string: &str,
+    schema: Option<&str>,
+) -> Result<tokio_postgres::Client, MiddlewareError> {
     let (client, connection) = tokio_postgres::connect(connection_string, NoTls)
         .await
         .map_err(|e| MiddlewareError::Execution(format!("failed to connect to PostgreSQL: {}", format_pg_error(&e))))?;
@@ -294,7 +373,19 @@ async fn connect(connection_string: &str) -> Result<tokio_postgres::Client, Midd
         }
     });
 
+    if let Some(schema) = schema.filter(|schema| !schema.trim().is_empty()) {
+        let search_path = format!("SET search_path TO {}, public", quote_ident(schema));
+        client
+            .batch_execute(&search_path)
+            .await
+            .map_err(|e| MiddlewareError::Execution(format!("failed to set schema: {}", format_pg_error(&e))))?;
+    }
+
     Ok(client)
+}
+
+fn quote_ident(ident: &str) -> String {
+    format!("\"{}\"", ident.replace('"', "\"\""))
 }
 
 fn format_pg_error(err: &tokio_postgres::Error) -> String {

@@ -22,6 +22,10 @@ use crate::myc::io::WriteMysqlExt;
 use crate::packet_writer::PacketWriter;
 use crate::{Column, ErrorKind, OkResponse};
 
+pub(crate) fn default_status_flags() -> StatusFlags {
+    StatusFlags::SERVER_STATUS_AUTOCOMMIT
+}
+
 pub(crate) async fn write_eof_packet<W: AsyncWrite + Unpin>(
     w: &mut PacketWriter<W>,
     s: StatusFlags,
@@ -34,8 +38,11 @@ pub(crate) async fn write_eof_packet<W: AsyncWrite + Unpin>(
 pub(crate) async fn write_ok_packet<W: AsyncWrite + Unpin>(
     w: &mut PacketWriter<W>,
     client_capabilities: CapabilityFlags,
-    ok_packet: OkResponse,
+    mut ok_packet: OkResponse,
 ) -> io::Result<()> {
+    if ok_packet.status_flags.is_empty() {
+        ok_packet.status_flags = default_status_flags();
+    }
     w.write_u8(ok_packet.header)?; // OK packet type
     w.write_lenenc_int(ok_packet.affected_rows)?;
     w.write_lenenc_int(ok_packet.last_insert_id)?;
@@ -103,10 +110,10 @@ where
 
     let prepare_capabilities = client_capabilities & !CapabilityFlags::CLIENT_DEPRECATE_EOF;
     if pi.len() > 0 {
-        write_column_definitions_41(pi, w, prepare_capabilities, false).await?;
+        write_column_definitions_41(pi, w, prepare_capabilities, false, false).await?;
     }
     if ci.len() > 0 {
-        write_column_definitions_41(ci, w, prepare_capabilities, false).await?;
+        write_column_definitions_41(ci, w, prepare_capabilities, false, false).await?;
     }
     Ok(())
 }
@@ -118,6 +125,7 @@ pub(crate) async fn write_column_definitions_41<'a, I, W>(
     w: &mut PacketWriter<W>,
     client_capabilities: CapabilityFlags,
     is_com_field_list: bool,
+    force_ok_terminator: bool,
 ) -> io::Result<()>
 where
     I: IntoIterator<Item = &'a Column>,
@@ -145,10 +153,12 @@ where
         w.end_packet().await?;
     }
 
-    if client_capabilities.contains(CapabilityFlags::CLIENT_DEPRECATE_EOF) {
+    if force_ok_terminator {
         write_ok_packet(w, client_capabilities, OkResponse::default()).await
+    } else if !client_capabilities.contains(CapabilityFlags::CLIENT_DEPRECATE_EOF) {
+        write_eof_packet(w, default_status_flags()).await
     } else {
-        write_eof_packet(w, StatusFlags::empty()).await
+        Ok(())
     }
 }
 
@@ -156,6 +166,7 @@ pub(crate) async fn column_definitions<'a, I, W>(
     i: I,
     w: &mut PacketWriter<W>,
     client_capabilities: CapabilityFlags,
+    force_ok_terminator: bool,
 ) -> io::Result<()>
 where
     I: IntoIterator<Item = &'a Column>,
@@ -165,5 +176,5 @@ where
     let i = i.into_iter();
     w.write_lenenc_int(i.len() as u64)?;
     w.end_packet().await?;
-    write_column_definitions_41(i, w, client_capabilities, false).await
+    write_column_definitions_41(i, w, client_capabilities, false, force_ok_terminator).await
 }

@@ -337,7 +337,7 @@ where
         writer.write_all(&server_capabilities_vec[..2])?; // The lower 2 bytes of the Capabilities Flags, 0x42
                                                           // self.writer.write_all(&[0x00, 0x42])?;
         writer.write_all(&[0x21])?; // UTF8_GENERAL_CI
-        writer.write_all(&[0x00, 0x00])?; // status_flags
+        writer.write_all(&crate::writers::default_status_flags().bits().to_le_bytes())?; // status_flags
         writer.write_all(&server_capabilities_vec[2..4])?; // The upper 2 bytes of the Capabilities Flags
 
         if default_auth_plugin.is_empty() {

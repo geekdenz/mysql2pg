@@ -140,6 +140,7 @@ impl<'a, W: AsyncWrite + Unpin> QueryResultWriter<'a, W> {
 
     async fn finalize(&mut self, more_exists: bool) -> io::Result<()> {
         let mut status = StatusFlags::empty();
+        status.set(StatusFlags::SERVER_STATUS_AUTOCOMMIT, true);
         if more_exists {
             status.set(StatusFlags::SERVER_MORE_RESULTS_EXISTS, true);
         }
@@ -255,6 +256,7 @@ where
                 self.columns,
                 self.result.as_mut().unwrap().writer,
                 self.client_capabilities,
+                false,
             )
             .await?;
         }
