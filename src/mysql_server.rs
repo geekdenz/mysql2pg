@@ -71,7 +71,7 @@ impl MySqlFrontendFactory {
             next_statement_id: 1,
             prepared: HashMap::new(),
             connection_id: NEXT_CONNECTION_ID.fetch_add(1, Ordering::Relaxed),
-            current_db: None,
+            current_db: default_database_name(),
             last_insert_id: 0,
             session_charset: "utf8mb4".to_string(),
             session_collation: "utf8mb4_general_ci".to_string(),
@@ -84,6 +84,8 @@ impl MySqlFrontendFactory {
 static NEXT_CONNECTION_ID: AtomicU32 = AtomicU32::new(9);
 static KILLED_CONNECTION_IDS: LazyLock<Mutex<HashSet<u32>>> =
     LazyLock::new(|| Mutex::new(HashSet::new()));
+static DEFAULT_DATABASE_NAME: LazyLock<Mutex<Option<String>>> =
+    LazyLock::new(|| Mutex::new(None));
 
 pub async fn serve_mysql(factory: MySqlFrontendFactory, bind_addr: String) -> anyhow::Result<()> {
     let listener = TcpListener::bind(&bind_addr).await?;
@@ -160,6 +162,7 @@ where
         } else {
             Some(schema.trim().to_string())
         };
+        set_default_database_name(self.current_db.as_deref());
         writer.ok().await?;
         Ok(())
     }
@@ -465,6 +468,8 @@ where
         if is_compat_noop_query(trimmed) {
             if let Some(database_name) = parse_create_database_name(trimmed) {
                 self.executor.create_schema(&database_name).await?;
+                self.current_db = Some(database_name.clone());
+                set_default_database_name(Some(&database_name));
                 results.completed(OkResponse::default()).await?;
                 return Ok(());
             }
@@ -473,6 +478,7 @@ where
                 if self.current_db.as_deref() == Some(database_name.as_str()) {
                     self.current_db = None;
                 }
+                clear_default_database_name_if_matches(&database_name);
                 results.completed(OkResponse::default()).await?;
                 return Ok(());
             }
@@ -960,6 +966,27 @@ fn is_compat_noop_query(query: &str) -> bool {
 
 fn active_schema_name(current_db: Option<&str>) -> Option<&str> {
     current_db.filter(|db| !db.trim().is_empty())
+}
+
+fn default_database_name() -> Option<String> {
+    DEFAULT_DATABASE_NAME.lock().ok().and_then(|db| db.clone())
+}
+
+fn set_default_database_name(db_name: Option<&str>) {
+    if let Ok(mut current) = DEFAULT_DATABASE_NAME.lock() {
+        *current = db_name
+            .map(str::trim)
+            .filter(|db| !db.is_empty())
+            .map(ToOwned::to_owned);
+    }
+}
+
+fn clear_default_database_name_if_matches(db_name: &str) {
+    if let Ok(mut current) = DEFAULT_DATABASE_NAME.lock() {
+        if current.as_deref() == Some(db_name) {
+            *current = None;
+        }
+    }
 }
 
 fn parse_database_name(sql: &str, prefix: &str) -> Option<String> {

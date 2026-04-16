@@ -387,6 +387,11 @@ impl<'a, W: AsyncWrite + Unpin + 'a> RowWriter<'a, W> {
                     ..Default::default()
                 };
                 self.result.as_mut().unwrap().last_end = Some(Finalizer::Ok(resp));
+            } else if self.result.as_ref().unwrap().is_bin {
+                // Binary protocol row packets and OK packets both start with 0x00.
+                // mysqlnd expects EOF-style termination here so the end-of-result
+                // marker cannot be confused with another row packet.
+                self.result.as_mut().unwrap().last_end = Some(Finalizer::Eof);
             } else if self
                 .client_capabilities
                 .contains(CapabilityFlags::CLIENT_DEPRECATE_EOF)

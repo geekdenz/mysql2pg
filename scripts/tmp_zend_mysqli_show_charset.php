@@ -54,11 +54,7 @@ echo "BIND_RESULT_OK\n";
 $rowCount = 0;
 while (true) {
     $status = $stmt->fetch();
-    if ($status === null) {
-        fwrite(STDERR, "FETCH_FAIL={$stmt->errno}:{$stmt->error}\n");
-        exit(14);
-    }
-    if ($status === false) {
+    if ($status === null || $status === false) {
         break;
     }
     $row = [];
