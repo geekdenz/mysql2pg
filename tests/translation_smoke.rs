@@ -122,6 +122,19 @@ fn show_variables_translation_smoke() {
 }
 
 #[test]
+fn mysql_system_variable_translation_smoke() {
+    let result = translate_sql(
+        "SELECT VERSION() AS version, CONCAT('[', @@sql_mode, ']') AS sql_mode, @@SESSION.version_comment AS comment",
+        &TranslatorConfig::default(),
+    )
+    .unwrap();
+    assert!(result.translated_sql.contains("'11.8.6-MariaDB'"));
+    assert!(result.translated_sql.contains("'NO_AUTO_VALUE_ON_ZERO'"));
+    assert!(result.translated_sql.contains("'MariaDB Server'"));
+    assert!(!result.translated_sql.contains("@@sql_mode"));
+}
+
+#[test]
 fn show_status_translation_smoke() {
     let result = translate_sql("SHOW STATUS LIKE 'Threads%'", &TranslatorConfig::default()).unwrap();
     assert!(result.translated_sql.contains("pg_stat_activity"));

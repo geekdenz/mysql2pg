@@ -29,6 +29,7 @@ pub fn translate_sql(sql: &str, cfg: &TranslatorConfig) -> Result<TranslationRes
             if cfg.normalize_mysql_backticks {
                 translated = replace_backticks(&translated);
             }
+            translated = rewrite_mysql_system_variables(&translated, &mut warnings);
             if cfg.rewrite_limit_comma {
                 translated = rewrite_limit_offset_count(&translated, &mut warnings);
             }
@@ -69,6 +70,7 @@ pub fn translate_sql(sql: &str, cfg: &TranslatorConfig) -> Result<TranslationRes
     if cfg.normalize_mysql_backticks {
         translated = replace_backticks(&translated);
     }
+    translated = rewrite_mysql_system_variables(&translated, &mut warnings);
     if cfg.rewrite_limit_comma {
         translated = rewrite_limit_offset_count(&translated, &mut warnings);
     }
@@ -171,6 +173,35 @@ fn quote_reserved_relation_references(sql: &str, warnings: &mut Vec<String>) -> 
     }
 
     translated
+}
+
+fn rewrite_mysql_system_variables(sql: &str, warnings: &mut Vec<String>) -> String {
+    let variable_re = Regex::new(
+        r"(?i)@@(?:(?:SESSION|GLOBAL)\.)?(sql_mode|version_comment|version|collation_connection|transaction_isolation|tx_isolation)\b",
+    )
+    .expect("valid MySQL system variable regex");
+    let version_fn_re = Regex::new(r"(?i)\bVERSION\s*\(\s*\)").expect("valid VERSION() regex");
+
+    if !variable_re.is_match(sql) && !version_fn_re.is_match(sql) {
+        return sql.to_string();
+    }
+
+    warnings.push("rewrote MySQL system variables to compatibility literals".to_string());
+    let out = variable_re.replace_all(sql, |caps: &Captures<'_>| {
+        match caps[1].to_ascii_lowercase().as_str() {
+            "sql_mode" => "'NO_AUTO_VALUE_ON_ZERO'".to_string(),
+            "version" => "'11.8.6-MariaDB'".to_string(),
+            "version_comment" => "'MariaDB Server'".to_string(),
+            "collation_connection" => "'utf8mb4_general_ci'".to_string(),
+            "transaction_isolation" | "tx_isolation" => "'REPEATABLE-READ'".to_string(),
+            _ => caps[0].to_string(),
+        }
+    })
+    .into_owned();
+
+    version_fn_re
+        .replace_all(&out, "'11.8.6-MariaDB'")
+        .into_owned()
 }
 
 fn translate_statements(
@@ -580,8 +611,8 @@ fn translate_show_variables(
                             ('time_zone', current_setting('TimeZone')), \
                             ('transaction_isolation', current_setting('transaction_isolation')), \
                             ('tx_isolation', current_setting('transaction_isolation')), \
-                            ('version', '8.0.0-mysql2pg'), \
-                            ('version_comment', 'mysql2pg-middleware') \
+                            ('version', '11.8.6-MariaDB'), \
+                            ('version_comment', 'MariaDB Server') \
                         ) AS v(\"Variable_name\", \"Value\") \
                     ) \
                     SELECT \"Variable_name\", \"Value\" FROM vars";

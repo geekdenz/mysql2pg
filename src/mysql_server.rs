@@ -13,6 +13,7 @@ use opensrv_mysql::{
     IntermediaryOptions, OkResponse, ParamParser, QueryResultWriter, StatementMetaWriter,
     ValueInner,
 };
+use regex::Regex;
 use sqlparser::ast::{Expr, Query, SelectItem, SetExpr, Statement};
 use tokio::{io::split, net::TcpListener};
 
@@ -86,6 +87,19 @@ static KILLED_CONNECTION_IDS: LazyLock<Mutex<HashSet<u32>>> =
     LazyLock::new(|| Mutex::new(HashSet::new()));
 static DEFAULT_DATABASE_NAME: LazyLock<Mutex<Option<String>>> =
     LazyLock::new(|| Mutex::new(None));
+const MYSQL_COMPAT_VERSION: &str = "11.8.6-MariaDB";
+const MYSQL_COMPAT_VERSION_COMMENT: &str = "MariaDB Server";
+static SELECT_SYSTEM_VARIABLE_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r#"(?ix)
+        ^\s*SELECT\s+
+        @@(?:(SESSION|GLOBAL)\.)?([A-Z_][A-Z0-9_]*)
+        (?:\s+(?:AS\s+)?`?([A-Z_][A-Z0-9_]*)`?)?
+        \s*;?\s*$
+        "#,
+    )
+    .expect("valid system variable SELECT regex")
+});
 
 pub async fn serve_mysql(factory: MySqlFrontendFactory, bind_addr: String) -> anyhow::Result<()> {
     let listener = TcpListener::bind(&bind_addr).await?;
@@ -143,7 +157,7 @@ where
     type Error = MySqlServerError;
 
     fn version(&self) -> String {
-        "8.0.0-mysql2pg".to_string()
+        MYSQL_COMPAT_VERSION.to_string()
     }
 
     fn connect_id(&self) -> u32 {
@@ -762,19 +776,19 @@ fn canned_response_for_query(query: &str) -> Option<(Vec<String>, Vec<Vec<String
     if normalized.eq_ignore_ascii_case("SELECT VERSION()") {
         return Some((
             vec!["VERSION()".to_string()],
-            vec![vec!["8.0.0-mysql2pg".to_string()]],
+            vec![vec![MYSQL_COMPAT_VERSION.to_string()]],
         ));
     }
     if normalized.eq_ignore_ascii_case("SELECT @@VERSION") {
         return Some((
             vec!["@@VERSION".to_string()],
-            vec![vec!["8.0.0-mysql2pg".to_string()]],
+            vec![vec![MYSQL_COMPAT_VERSION.to_string()]],
         ));
     }
     if normalized.eq_ignore_ascii_case("SELECT @@VERSION_COMMENT") {
         return Some((
             vec!["@@VERSION_COMMENT".to_string()],
-            vec![vec!["mysql2pg-middleware".to_string()]],
+            vec![vec![MYSQL_COMPAT_VERSION_COMMENT.to_string()]],
         ));
     }
     if normalized.eq_ignore_ascii_case("SELECT @@SESSION.SQL_MODE")
@@ -797,6 +811,15 @@ fn dynamic_canned_response_for_query(
     query: &str,
 ) -> Option<(Vec<String>, Vec<Vec<String>>)> {
     let normalized = query.trim();
+    if let Some(response) = dynamic_canned_response_for_system_variable_select(
+        session_collation,
+        session_sql_mode,
+        transaction_isolation,
+        normalized,
+    ) {
+        return Some(response);
+    }
+
     if normalized.eq_ignore_ascii_case("SELECT CONNECTION_ID()") {
         return Some((
             vec!["CONNECTION_ID()".to_string()],
@@ -815,23 +838,6 @@ fn dynamic_canned_response_for_query(
             vec![vec![session_collation.to_string()]],
         ));
     }
-    if normalized.eq_ignore_ascii_case("SELECT @@SESSION.SQL_MODE")
-        || normalized.eq_ignore_ascii_case("SELECT @@SQL_MODE")
-    {
-        return Some((
-            vec![normalized.to_ascii_lowercase()],
-            vec![vec![session_sql_mode.to_string()]],
-        ));
-    }
-    if normalized.eq_ignore_ascii_case("SELECT @@TRANSACTION_ISOLATION")
-        || normalized.eq_ignore_ascii_case("SELECT @@SESSION.TRANSACTION_ISOLATION")
-        || normalized.eq_ignore_ascii_case("SELECT @@TX_ISOLATION")
-    {
-        return Some((
-            vec![normalized.to_ascii_lowercase()],
-            vec![vec![transaction_isolation.to_string()]],
-        ));
-    }
     if normalized.eq_ignore_ascii_case("SHOW GLOBAL VARIABLES LIKE 'T%_ISOLATION'")
         || normalized.eq_ignore_ascii_case("SHOW GLOBAL VARIABLES LIKE 't%_isolation'")
     {
@@ -844,6 +850,39 @@ fn dynamic_canned_response_for_query(
         ));
     }
     None
+}
+
+fn dynamic_canned_response_for_system_variable_select(
+    session_collation: &str,
+    session_sql_mode: &str,
+    transaction_isolation: &str,
+    query: &str,
+) -> Option<(Vec<String>, Vec<Vec<String>>)> {
+    let captures = SELECT_SYSTEM_VARIABLE_RE.captures(query)?;
+    let scope = captures
+        .get(1)
+        .map(|value| value.as_str().to_ascii_lowercase());
+    let variable = captures.get(2)?.as_str().to_ascii_lowercase();
+    let alias = captures.get(3).map(|value| value.as_str().to_string());
+
+    let value = match variable.as_str() {
+        "sql_mode" => session_sql_mode.to_string(),
+        "collation_connection" => session_collation.to_string(),
+        "transaction_isolation" | "tx_isolation" => transaction_isolation.to_string(),
+        "version" => MYSQL_COMPAT_VERSION.to_string(),
+        "version_comment" => MYSQL_COMPAT_VERSION_COMMENT.to_string(),
+        _ => return None,
+    };
+
+    let column_name = alias.unwrap_or_else(|| {
+        if let Some(scope) = scope {
+            format!("@@{scope}.{variable}")
+        } else {
+            format!("@@{variable}")
+        }
+    });
+
+    Some((vec![column_name], vec![vec![value]]))
 }
 
 fn parse_kill_connection_id(query: &str) -> Option<u32> {
@@ -884,6 +923,11 @@ fn handle_mysql_session_query(
         return Ok(Some(OkResponse::default()));
     }
 
+    if is_set_sql_mode_query(&upper) {
+        backend.session_sql_mode = parse_set_sql_mode_value(trimmed);
+        return Ok(Some(OkResponse::default()));
+    }
+
     if upper.starts_with("SET SESSION TRANSACTION ISOLATION LEVEL ") {
         let level = trimmed["SET SESSION TRANSACTION ISOLATION LEVEL ".len()..].trim();
         backend.transaction_isolation = normalize_transaction_isolation(level);
@@ -902,14 +946,16 @@ fn handle_mysql_session_query(
 fn apply_set_names(backend: &mut MySqlBackend, sql: &str) -> Result<(), MySqlServerError> {
     let payload = sql["SET NAMES ".len()..].trim();
     let mut parts = payload.splitn(2, char::is_whitespace);
-    let charset = parts
+    let charset = normalize_mysql_charset(
+        parts
         .next()
         .unwrap_or_default()
         .trim_matches('\'')
         .trim_matches('"')
-        .to_ascii_lowercase();
+        .trim(),
+    );
 
-    if !matches!(charset.as_str(), "utf8" | "utf8mb3" | "utf8mb4") {
+    if default_mysql_collation_for_charset(&charset).is_none() {
         return Err(MySqlServerError::Middleware(MiddlewareError::Execution(format!(
             "unknown character set: {charset}"
         ))));
@@ -934,16 +980,53 @@ fn apply_set_names(backend: &mut MySqlBackend, sql: &str) -> Result<(), MySqlSer
     }
 
     if let Some(collation) = collation {
-        if !collation.starts_with(&(charset.clone() + "_")) {
+        let collation = normalize_mysql_collation(&charset, &collation)?;
+        if !collation_matches_charset(&charset, &collation) {
             return Err(MySqlServerError::Middleware(MiddlewareError::Execution(format!(
                 "unknown collation: {collation}"
             ))));
         }
         backend.session_collation = collation;
+    } else if let Some(default_collation) = default_mysql_collation_for_charset(&charset) {
+        backend.session_collation = default_collation.to_string();
     }
 
     backend.session_charset = charset;
     Ok(())
+}
+
+fn normalize_mysql_charset(charset: &str) -> String {
+    match charset.to_ascii_lowercase().as_str() {
+        "utf8mb3" => "utf8".to_string(),
+        other => other.to_string(),
+    }
+}
+
+fn normalize_mysql_collation(charset: &str, collation: &str) -> Result<String, MySqlServerError> {
+    let collation = collation.to_ascii_lowercase();
+    if collation == "default" || matches!(collation.as_str(), "utf8" | "utf8mb3" | "utf8mb4") {
+        return default_mysql_collation_for_charset(charset)
+            .map(ToOwned::to_owned)
+            .ok_or_else(|| {
+                MySqlServerError::Middleware(MiddlewareError::Execution(format!(
+                    "unknown character set: {charset}"
+                )))
+            });
+    }
+
+    Ok(collation)
+}
+
+fn default_mysql_collation_for_charset(charset: &str) -> Option<&'static str> {
+    match charset {
+        "utf8" => Some("utf8_general_ci"),
+        "utf8mb4" => Some("utf8mb4_general_ci"),
+        _ => None,
+    }
+}
+
+fn collation_matches_charset(charset: &str, collation: &str) -> bool {
+    collation.starts_with(&(charset.to_string() + "_"))
 }
 
 fn normalize_transaction_isolation(level: &str) -> String {
@@ -955,10 +1038,32 @@ fn normalize_transaction_isolation(level: &str) -> String {
         .to_ascii_uppercase()
 }
 
+fn is_set_sql_mode_query(upper: &str) -> bool {
+    upper.starts_with("SET SQL_MODE")
+        || upper.starts_with("SET SESSION SQL_MODE")
+        || upper.starts_with("SET @@SQL_MODE")
+        || upper.starts_with("SET @@SESSION.SQL_MODE")
+}
+
+fn parse_set_sql_mode_value(sql: &str) -> String {
+    let Some((_, value)) = sql.split_once('=') else {
+        return String::new();
+    };
+
+    value
+        .trim()
+        .trim_end_matches(';')
+        .trim()
+        .trim_matches('\'')
+        .trim_matches('"')
+        .to_string()
+}
+
 fn is_compat_noop_query(query: &str) -> bool {
     let normalized = query.trim().to_ascii_uppercase();
     normalized.starts_with("SET NAMES ")
         || normalized.starts_with("SET SQL_MODE")
+        || is_set_sql_mode_query(&normalized)
         || normalized.starts_with("CREATE DATABASE ")
         || normalized.starts_with("DROP DATABASE ")
         || is_mysql_session_compat_noop(&normalized)
@@ -1370,6 +1475,61 @@ mod tests {
         let (columns, rows) = canned_response_for_query("SELECT @@SESSION.sql_mode").unwrap();
         assert_eq!(columns, vec!["SELECT @@SESSION.sql_mode".to_string()]);
         assert_eq!(rows, vec![vec!["NO_AUTO_VALUE_ON_ZERO".to_string()]]);
+    }
+
+    #[test]
+    fn dynamic_canned_response_supports_aliased_sql_mode_selects() {
+        let (columns, rows) = dynamic_canned_response_for_query(
+            10,
+            Some("latest_stable"),
+            "utf8mb4_general_ci",
+            "NO_AUTO_VALUE_ON_ZERO",
+            "REPEATABLE-READ",
+            "SELECT @@sql_mode AS sql_mode",
+        )
+        .unwrap();
+        assert_eq!(columns, vec!["sql_mode".to_string()]);
+        assert_eq!(rows, vec![vec!["NO_AUTO_VALUE_ON_ZERO".to_string()]]);
+
+        let (columns, rows) = dynamic_canned_response_for_query(
+            10,
+            Some("latest_stable"),
+            "utf8mb4_general_ci",
+            "ANSI_QUOTES",
+            "REPEATABLE-READ",
+            "SELECT @@SESSION.sql_mode",
+        )
+        .unwrap();
+        assert_eq!(columns, vec!["@@session.sql_mode".to_string()]);
+        assert_eq!(rows, vec![vec!["ANSI_QUOTES".to_string()]]);
+    }
+
+    #[test]
+    fn set_sql_mode_variants_are_session_compat_queries() {
+        assert!(is_compat_noop_query("SET SESSION sql_mode = 'ANSI_QUOTES'"));
+        assert!(is_compat_noop_query("SET @@sql_mode = ''"));
+        assert!(is_compat_noop_query(
+            "SET @@SESSION.sql_mode = 'NO_AUTO_VALUE_ON_ZERO'"
+        ));
+    }
+
+    #[test]
+    fn charset_style_collation_values_map_to_mysql_defaults() {
+        assert_eq!(normalize_mysql_charset("utf8mb3"), "utf8");
+        assert_eq!(
+            normalize_mysql_collation("utf8", "utf8").unwrap(),
+            "utf8_general_ci"
+        );
+        assert_eq!(
+            normalize_mysql_collation("utf8mb4", "utf8").unwrap(),
+            "utf8mb4_general_ci"
+        );
+        assert_eq!(
+            normalize_mysql_collation("utf8mb4", "DEFAULT").unwrap(),
+            "utf8mb4_general_ci"
+        );
+        assert!(collation_matches_charset("utf8", "utf8_general_ci"));
+        assert!(collation_matches_charset("utf8mb4", "utf8mb4_general_ci"));
     }
 }
 

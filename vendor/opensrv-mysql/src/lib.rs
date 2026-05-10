@@ -587,7 +587,7 @@ where
                             if q.starts_with(b"SELECT @@") || q.starts_with(b"select @@") {
                                 let w = QueryResultWriter::new(
                                     &mut self.writer,
-                                    true,
+                                    false,
                                     self.client_capabilities,
                                 );
 
@@ -631,7 +631,7 @@ where
                             } else {
                                 let w = QueryResultWriter::new(
                                     &mut self.writer,
-                                    true,
+                                    false,
                                     self.client_capabilities,
                                 );
                                 self.shim

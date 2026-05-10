@@ -25,3 +25,6 @@ docker compose -f "${COMPOSE_FILE}" exec -T matomo-tests-web bash -lc \
   "php tests/resources/install-matomo.php . '{\"host\":\"matomo-tests-middleware\",\"username\":\"anyuser\",\"password\":\"matomo\",\"port\":3306,\"adapter\":\"MYSQLI\",\"type\":\"InnoDB\",\"schema\":\"Mysql\",\"charset\":\"utf8mb4\",\"collation\":\"utf8mb4_general_ci\"}' matomo-tests-web"
 
 docker compose -f "${COMPOSE_FILE}" exec -T matomo-tests-web php /opt/mysql2pg/scripts/update-matomo-test-config.php
+
+docker compose -f "${COMPOSE_FILE}" exec -T matomo-tests-web php \
+  /opt/mysql2pg/scripts/set-matomo-admin-login.php root 'ChangeMe123!' root@example.test
