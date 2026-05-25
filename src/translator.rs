@@ -1,10 +1,10 @@
 use regex::{Captures, Regex};
 use serde::Serialize;
 use sqlparser::ast::{
-    ColumnDef, ColumnOption, CreateTable, DataType, ExactNumberInfo, Expr, ObjectName, OnConflict,
-    OnConflictAction, OnInsert, ShowCharset, ShowCreateObject, ShowStatementFilter,
-    ShowStatementFilterPosition, ShowStatementInParentType, ShowStatementOptions, Statement,
-    TableConstraint, TimezoneInfo,
+    AlterTable, AlterTableOperation, ColumnDef, ColumnOption, CreateTable, DataType,
+    ExactNumberInfo, Expr, ObjectName, OnConflict, OnConflictAction, OnInsert, ShowCharset,
+    ShowCreateObject, ShowStatementFilter, ShowStatementFilterPosition, ShowStatementInParentType,
+    ShowStatementOptions, Statement, TableConstraint, TimezoneInfo,
 };
 use sqlparser::ast::table_constraints::{IndexConstraint, UniqueConstraint};
 
@@ -264,6 +264,7 @@ fn translate_statement(stmt: &Statement, warnings: &mut Vec<String>) -> Result<S
         }
         Statement::ShowCreate { obj_type, obj_name } => translate_show_create(obj_type, obj_name, warnings),
         Statement::ExplainTable { table_name, .. } => translate_describe_table(table_name, warnings),
+        Statement::AlterTable(alter) => translate_alter_table(alter, warnings),
         _ => Ok(stmt.to_string()),
     }
 }
@@ -1197,6 +1198,53 @@ fn translate_create_table(
         statements.extend(post_statements);
         Ok(statements.join("; "))
     }
+}
+
+fn translate_alter_table(
+    alter: &AlterTable,
+    warnings: &mut Vec<String>,
+) -> Result<String, MiddlewareError> {
+    if alter.table_type.is_some() || alter.location.is_some() || alter.on_cluster.is_some() {
+        return Err(MiddlewareError::Translation(
+            "complex ALTER TABLE variants are not yet supported for PostgreSQL translation".to_string(),
+        ));
+    }
+
+    let mut operations = Vec::new();
+
+    for operation in &alter.operations {
+        match operation {
+            AlterTableOperation::AddColumn {
+                if_not_exists,
+                column_def,
+                column_position,
+                ..
+            } => {
+                let (rendered_column, constraints) = translate_column(column_def, warnings)?;
+                let if_not_exists = if *if_not_exists { "IF NOT EXISTS " } else { "" };
+                operations.push(format!("ADD COLUMN {if_not_exists}{rendered_column}"));
+                for constraint in constraints {
+                    operations.push(format!("ADD {constraint}"));
+                }
+                if column_position.is_some() {
+                    warnings.push(format!(
+                        "dropped MySQL column position clause from ALTER TABLE ADD COLUMN `{}`",
+                        column_def.name
+                    ));
+                }
+            }
+            other => operations.push(other.to_string()),
+        }
+    }
+
+    let if_exists = if alter.if_exists { "IF EXISTS " } else { "" };
+    let only = if alter.only { "ONLY " } else { "" };
+
+    Ok(format!(
+        "ALTER TABLE {if_exists}{only}{} {}",
+        quote_object_name(&alter.name),
+        operations.join(", ")
+    ))
 }
 
 fn translate_table_constraint(constraint: &TableConstraint) -> Result<String, MiddlewareError> {

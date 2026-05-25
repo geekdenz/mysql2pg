@@ -205,6 +205,27 @@ fn create_table_with_inline_key_translation_smoke() {
 }
 
 #[test]
+fn alter_table_add_column_unsigned_translation_smoke() {
+    let sql = "ALTER TABLE matomo_log_visit ADD COLUMN last_idlink_va BIGINT UNSIGNED DEFAULT NULL, ADD COLUMN custom_dimension_1 VARCHAR(255) DEFAULT NULL, ADD COLUMN custom_dimension_rank SMALLINT UNSIGNED DEFAULT 0;";
+    let result = translate_sql(sql, &TranslatorConfig::default()).unwrap();
+
+    assert!(result.translated_sql.contains("ALTER TABLE \"matomo_log_visit\""));
+    assert!(result
+        .translated_sql
+        .contains("ADD COLUMN \"last_idlink_va\" BIGINT DEFAULT NULL"));
+    assert!(result
+        .translated_sql
+        .contains("ADD COLUMN \"custom_dimension_1\" VARCHAR(255) DEFAULT NULL"));
+    assert!(result
+        .translated_sql
+        .contains("ADD COLUMN \"custom_dimension_rank\" INTEGER DEFAULT 0"));
+    assert!(result
+        .translated_sql
+        .contains("ADD CHECK (custom_dimension_rank >= 0 AND custom_dimension_rank <= 65535)"));
+    assert!(!result.translated_sql.contains("UNSIGNED"));
+}
+
+#[test]
 fn create_table_with_desc_inline_key_translation_smoke() {
     let sql = r#"
         CREATE TABLE log_visit (
