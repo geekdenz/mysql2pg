@@ -143,7 +143,15 @@ http://127.0.0.1:8081
 
 If `MATOMO_PORT` is set in `.env`, use that port instead.
 
-The Matomo container is configured to use the middleware's MySQL-compatible frontend:
+The Matomo app/config volume defaults to `mysql2pg-middleware_matomo_manual_install_data`:
+
+```env
+MATOMO_DATA_VOLUME=mysql2pg-middleware_matomo_manual_install_data
+```
+
+This intentionally avoids reusing older Matomo app/config volumes that can contain a generated `config.ini.php` pointing at a database where the required tables do not exist. That stale state shows up as errors such as `relation "matomo_changes" does not exist`.
+
+The Matomo container does not set `MATOMO_DATABASE_*` environment variables. Configure the database manually in the installer. To test the middleware's MySQL-compatible frontend, use:
 
 - host: `middleware`
 - adapter: `MYSQLI`
@@ -161,6 +169,18 @@ docker compose --profile matomo logs --tail=120 matomo
 ```
 
 `Exited (0)` with an Apache `caught SIGWINCH, shutting down gracefully` log line means the container was stopped cleanly; it is not a startup crash. Matomo application errors such as missing `matomo_user` or `matomo_changes` tables are separate install/database-state issues after Apache has started.
+
+If you see `relation "matomo_changes" does not exist`, recreate Matomo with the clean app/config volume:
+
+```bash
+docker compose --profile matomo up -d --force-recreate matomo
+```
+
+To inspect the old stale volume instead of using the clean default, set:
+
+```env
+MATOMO_DATA_VOLUME=mysql2pg-middleware_matomo_data
+```
 
 ### Load the compatibility fixture
 

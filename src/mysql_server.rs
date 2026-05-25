@@ -87,8 +87,8 @@ static KILLED_CONNECTION_IDS: LazyLock<Mutex<HashSet<u32>>> =
     LazyLock::new(|| Mutex::new(HashSet::new()));
 static DEFAULT_DATABASE_NAME: LazyLock<Mutex<Option<String>>> =
     LazyLock::new(|| Mutex::new(None));
-const MYSQL_COMPAT_VERSION: &str = "9.7.0";
-const MYSQL_COMPAT_VERSION_COMMENT: &str = "MySQL Community Server";
+const MYSQL_COMPAT_VERSION: &str = "11.8.7-MariaDB-ubu2404";
+const MYSQL_COMPAT_VERSION_COMMENT: &str = "MariaDB Server";
 static SELECT_SYSTEM_VARIABLE_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
         r#"(?ix)
@@ -859,10 +859,9 @@ fn dynamic_canned_response_for_system_variable_select(
     query: &str,
 ) -> Option<(Vec<String>, Vec<Vec<String>>)> {
     let captures = SELECT_SYSTEM_VARIABLE_RE.captures(query)?;
-    let scope = captures
-        .get(1)
-        .map(|value| value.as_str().to_ascii_lowercase());
-    let variable = captures.get(2)?.as_str().to_ascii_lowercase();
+    let scope = captures.get(1).map(|value| value.as_str());
+    let variable_match = captures.get(2)?;
+    let variable = variable_match.as_str().to_ascii_lowercase();
     let alias = captures.get(3).map(|value| value.as_str().to_string());
 
     let value = match variable.as_str() {
@@ -876,9 +875,9 @@ fn dynamic_canned_response_for_system_variable_select(
 
     let column_name = alias.unwrap_or_else(|| {
         if let Some(scope) = scope {
-            format!("@@{scope}.{variable}")
+            format!("@@{scope}.{}", variable_match.as_str())
         } else {
-            format!("@@{variable}")
+            format!("@@{}", variable_match.as_str())
         }
     });
 
@@ -1500,8 +1499,24 @@ mod tests {
             "SELECT @@SESSION.sql_mode",
         )
         .unwrap();
-        assert_eq!(columns, vec!["@@session.sql_mode".to_string()]);
+        assert_eq!(columns, vec!["@@SESSION.sql_mode".to_string()]);
         assert_eq!(rows, vec![vec!["ANSI_QUOTES".to_string()]]);
+    }
+
+    #[test]
+    fn dynamic_canned_response_preserves_system_variable_column_case() {
+        let (columns, rows) = dynamic_canned_response_for_query(
+            10,
+            Some("latest_stable"),
+            "utf8mb4_general_ci",
+            "NO_AUTO_VALUE_ON_ZERO",
+            "REPEATABLE-READ",
+            "SELECT @@VERSION",
+        )
+        .unwrap();
+
+        assert_eq!(columns, vec!["@@VERSION".to_string()]);
+        assert_eq!(rows, vec![vec!["11.8.7-MariaDB-ubu2404".to_string()]]);
     }
 
     #[test]

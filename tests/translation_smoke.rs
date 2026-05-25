@@ -128,9 +128,9 @@ fn mysql_system_variable_translation_smoke() {
         &TranslatorConfig::default(),
     )
     .unwrap();
-    assert!(result.translated_sql.contains("'9.7.0'"));
+    assert!(result.translated_sql.contains("'11.8.7-MariaDB-ubu2404'"));
     assert!(result.translated_sql.contains("'NO_AUTO_VALUE_ON_ZERO'"));
-    assert!(result.translated_sql.contains("'MySQL Community Server'"));
+    assert!(result.translated_sql.contains("'MariaDB Server'"));
     assert!(!result.translated_sql.contains("@@sql_mode"));
 }
 

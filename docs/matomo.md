@@ -26,9 +26,19 @@ http://127.0.0.1:8081
 
 If `MATOMO_PORT` is set in `.env`, use that port instead.
 
+The Matomo app/config volume defaults to a clean named volume:
+
+```env
+MATOMO_DATA_VOLUME=mysql2pg-middleware_matomo_manual_install_data
+```
+
+This avoids stale generated Matomo config from older Matomo app/config volumes. A stale `config/config.ini.php` can make Matomo treat itself as installed while the configured database is missing tables, which produces errors such as `relation "matomo_changes" does not exist`.
+
 ## Database wiring
 
-Matomo talks to the middleware over the MySQL protocol:
+The Matomo container does not set `MATOMO_DATABASE_*` environment variables, so database setup happens manually in the installer.
+
+To test the middleware's MySQL-compatible frontend, enter:
 
 - host: `middleware`
 - adapter: `MYSQLI`
@@ -60,3 +70,17 @@ docker compose --profile matomo config
 ```
 
 That confirms the Compose wiring and rendered image tag. It does not start Matomo or modify Matomo configuration.
+
+## Stale app volume
+
+If Matomo reports missing tables such as `matomo_changes`, recreate the container using the clean default app/config volume:
+
+```bash
+docker compose --profile matomo up -d --force-recreate matomo
+```
+
+To intentionally use the old volume for inspection or rollback, set:
+
+```env
+MATOMO_DATA_VOLUME=mysql2pg-middleware_matomo_data
+```
