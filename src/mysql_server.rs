@@ -87,8 +87,8 @@ static KILLED_CONNECTION_IDS: LazyLock<Mutex<HashSet<u32>>> =
     LazyLock::new(|| Mutex::new(HashSet::new()));
 static DEFAULT_DATABASE_NAME: LazyLock<Mutex<Option<String>>> =
     LazyLock::new(|| Mutex::new(None));
-const MYSQL_COMPAT_VERSION: &str = "11.8.6-MariaDB";
-const MYSQL_COMPAT_VERSION_COMMENT: &str = "MariaDB Server";
+const MYSQL_COMPAT_VERSION: &str = "9.7.0";
+const MYSQL_COMPAT_VERSION_COMMENT: &str = "MySQL Community Server";
 static SELECT_SYSTEM_VARIABLE_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
         r#"(?ix)

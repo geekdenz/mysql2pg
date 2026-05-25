@@ -115,12 +115,24 @@ MYSQL_FRONTEND_PORT=3307
 
 ### Run Matomo against the middleware
 
-The compose file includes an optional `matomo` service pinned to the latest stable Matomo release verified for this repository: `5.8.0-apache`.
+The compose file includes an optional `matomo` service using the official Matomo Docker image. It defaults to `matomo:5.10.0-apache`, the current stable Apache tag checked on May 25, 2026.
 
-Start it with:
+The service is behind the `matomo` Compose profile, so a plain `docker compose up -d` starts only the middleware and PostgreSQL. Start Matomo explicitly with:
+
+```bash
+docker compose --profile matomo up -d matomo
+```
+
+To rebuild the middleware and start the whole Matomo stack:
 
 ```bash
 docker compose --profile matomo up --build -d
+```
+
+To force the Matomo container to be recreated with the currently configured image tag:
+
+```bash
+docker compose --profile matomo up -d --pull always --force-recreate matomo
 ```
 
 Then open:
@@ -128,6 +140,8 @@ Then open:
 ```text
 http://127.0.0.1:8081
 ```
+
+If `MATOMO_PORT` is set in `.env`, use that port instead.
 
 The Matomo container is configured to use the middleware's MySQL-compatible frontend:
 
@@ -138,6 +152,15 @@ The Matomo container is configured to use the middleware's MySQL-compatible fron
 - password: `matomo`
 
 The real storage remains PostgreSQL behind the middleware.
+
+If Matomo is not visible, first check whether the profile-gated service is running:
+
+```bash
+docker compose --profile matomo ps -a
+docker compose --profile matomo logs --tail=120 matomo
+```
+
+`Exited (0)` with an Apache `caught SIGWINCH, shutting down gracefully` log line means the container was stopped cleanly; it is not a startup crash. Matomo application errors such as missing `matomo_user` or `matomo_changes` tables are separate install/database-state issues after Apache has started.
 
 ### Load the compatibility fixture
 

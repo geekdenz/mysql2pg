@@ -190,8 +190,8 @@ fn rewrite_mysql_system_variables(sql: &str, warnings: &mut Vec<String>) -> Stri
     let out = variable_re.replace_all(sql, |caps: &Captures<'_>| {
         match caps[1].to_ascii_lowercase().as_str() {
             "sql_mode" => "'NO_AUTO_VALUE_ON_ZERO'".to_string(),
-            "version" => "'11.8.6-MariaDB'".to_string(),
-            "version_comment" => "'MariaDB Server'".to_string(),
+            "version" => "'9.7.0'".to_string(),
+            "version_comment" => "'MySQL Community Server'".to_string(),
             "collation_connection" => "'utf8mb4_general_ci'".to_string(),
             "transaction_isolation" | "tx_isolation" => "'REPEATABLE-READ'".to_string(),
             _ => caps[0].to_string(),
@@ -200,7 +200,7 @@ fn rewrite_mysql_system_variables(sql: &str, warnings: &mut Vec<String>) -> Stri
     .into_owned();
 
     version_fn_re
-        .replace_all(&out, "'11.8.6-MariaDB'")
+        .replace_all(&out, "'9.7.0'")
         .into_owned()
 }
 
@@ -611,8 +611,8 @@ fn translate_show_variables(
                             ('time_zone', current_setting('TimeZone')), \
                             ('transaction_isolation', current_setting('transaction_isolation')), \
                             ('tx_isolation', current_setting('transaction_isolation')), \
-                            ('version', '11.8.6-MariaDB'), \
-                            ('version_comment', 'MariaDB Server') \
+                            ('version', '9.7.0'), \
+                            ('version_comment', 'MySQL Community Server') \
                         ) AS v(\"Variable_name\", \"Value\") \
                     ) \
                     SELECT \"Variable_name\", \"Value\" FROM vars";

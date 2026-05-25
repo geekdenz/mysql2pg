@@ -42,7 +42,9 @@ services:
       - postgres_data:/var/lib/postgresql/data
 
   matomo:
-    image: matomo:${MATOMO_IMAGE_TAG:-5.8.0-apache}
+    env_file:
+      - .env
+    image: matomo:${MATOMO_IMAGE_TAG:-5.10.0-apache}
     profiles: ["matomo"]
     environment:
       MATOMO_DATABASE_HOST: ${MATOMO_DATABASE_HOST:-middleware}

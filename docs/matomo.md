@@ -4,7 +4,13 @@ This repository includes an optional Docker Compose service for testing `mysql2p
 
 ## Version
 
-The Compose service is pinned to Matomo `5.8.0-apache`, which was the latest stable release verified for this repository on April 5, 2026.
+The Compose service uses the official Matomo Docker image and defaults to `matomo:5.10.0-apache`, the current stable Apache tag checked on May 25, 2026.
+
+You can override the tag without editing Compose:
+
+```bash
+MATOMO_IMAGE_TAG=5.10.0-apache docker compose --profile matomo up --build -d
+```
 
 ## Start the stack
 
@@ -17,6 +23,8 @@ Matomo will be available on:
 ```text
 http://127.0.0.1:8081
 ```
+
+If `MATOMO_PORT` is set in `.env`, use that port instead.
 
 ## Database wiring
 
@@ -43,14 +51,12 @@ This setup is useful for checking:
 
 The Matomo service should be able to start and reach the initial web installer. Full application installation may still hit unsupported SQL, especially around broader MySQL DDL such as `ALTER TABLE`, index management, and other schema-management statements not fully translated yet.
 
-## Verified result
+## Configuration check
 
-Verified in this repository on April 5, 2026:
+Validate the Matomo service without starting containers:
 
-- the Matomo `5.8.0-apache` container started successfully
-- the installer page rendered with the title `Matomo 5.8.0 › Installation`
-- Matomo's bundled PHP `mysqli` client connected to the middleware and successfully executed:
-  - `SHOW VARIABLES LIKE 'version%'`
-  - `SHOW TABLES`
+```bash
+docker compose --profile matomo config
+```
 
-That confirms the Compose wiring and the initial MySQL compatibility path for a real Matomo container. It does not yet guarantee that the full Matomo database installation workflow completes end to end.
+That confirms the Compose wiring and rendered image tag. It does not start Matomo or modify Matomo configuration.
