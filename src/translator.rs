@@ -39,6 +39,7 @@ pub fn translate_sql(sql: &str, cfg: &TranslatorConfig) -> Result<TranslationRes
             if cfg.rewrite_mysql_functions {
                 translated = rewrite_mysql_functions(&translated, &mut warnings);
             }
+            translated = strip_mysql_select_modifiers(&translated, &mut warnings);
             if cfg.rewrite_json_operators {
                 translated = rewrite_json_extract(&translated, &mut warnings);
             }
@@ -80,6 +81,7 @@ pub fn translate_sql(sql: &str, cfg: &TranslatorConfig) -> Result<TranslationRes
     if cfg.rewrite_mysql_functions {
         translated = rewrite_mysql_functions(&translated, &mut warnings);
     }
+    translated = strip_mysql_select_modifiers(&translated, &mut warnings);
     if cfg.rewrite_json_operators {
         translated = rewrite_json_extract(&translated, &mut warnings);
     }
@@ -2000,6 +2002,18 @@ fn rewrite_mysql_functions(sql: &str, warnings: &mut Vec<String>) -> String {
     }
 
     out
+}
+
+fn strip_mysql_select_modifiers(sql: &str, warnings: &mut Vec<String>) -> String {
+    let re = Regex::new(r"(?i)\bSELECT\s+(DISTINCT\s+)?SQL_NO_CACHE\s+").expect("valid regex");
+    if re.is_match(sql) {
+        warnings.push("stripped MySQL SELECT modifier SQL_NO_CACHE".to_string());
+    }
+    re.replace_all(sql, |caps: &Captures| {
+        let distinct = caps.get(1).map(|m| m.as_str()).unwrap_or("");
+        format!("SELECT {distinct}")
+    })
+    .to_string()
 }
 
 fn rewrite_json_extract(sql: &str, warnings: &mut Vec<String>) -> String {

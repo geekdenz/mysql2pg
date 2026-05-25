@@ -10,6 +10,18 @@ fn select_translation_smoke() {
 }
 
 #[test]
+fn sql_no_cache_select_modifier_translation_smoke() {
+    let sql = "SELECT SQL_NO_CACHE `value` FROM `matomo_locks` WHERE `key` = 'UsersManager.changePermissions' AND UNIX_TIMESTAMP() <= expiry_time LIMIT 1";
+    let result = translate_sql(sql, &TranslatorConfig::default()).unwrap();
+
+    assert!(result.translated_sql.starts_with("SELECT \"value\" FROM \"matomo_locks\""));
+    assert!(result
+        .translated_sql
+        .contains("EXTRACT(EPOCH FROM CURRENT_TIMESTAMP) <= expiry_time"));
+    assert!(!result.translated_sql.contains("SQL_NO_CACHE"));
+}
+
+#[test]
 fn on_duplicate_key_update_translation_smoke() {
     let sql = "INSERT INTO user_language (login, language) VALUES (?, ?) ON DUPLICATE KEY UPDATE language = ?";
     let result = translate_sql(sql, &TranslatorConfig::default()).unwrap();
