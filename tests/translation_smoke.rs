@@ -238,6 +238,74 @@ fn alter_table_add_column_unsigned_translation_smoke() {
 }
 
 #[test]
+fn alter_table_modify_column_unsigned_translation_smoke() {
+    let sql = "ALTER TABLE `matomo_log_visit` MODIFY COLUMN `visitor_seconds_since_first` INT(11) UNSIGNED NULL, MODIFY COLUMN `visitor_count_visits` INT(11) UNSIGNED NOT NULL DEFAULT 0, MODIFY COLUMN `config_device_model` VARCHAR(100) CHARACTER SET utf8 COLLATE utf8_general_ci NULL DEFAULT NULL;";
+    let result = translate_sql(sql, &TranslatorConfig::default()).unwrap();
+
+    assert!(result.translated_sql.contains("ALTER TABLE \"matomo_log_visit\""));
+    assert!(result
+        .translated_sql
+        .contains("ALTER COLUMN \"visitor_seconds_since_first\" TYPE BIGINT"));
+    assert!(result
+        .translated_sql
+        .contains("ALTER COLUMN \"visitor_seconds_since_first\" DROP NOT NULL"));
+    assert!(result
+        .translated_sql
+        .contains("ALTER COLUMN \"visitor_count_visits\" SET NOT NULL"));
+    assert!(result
+        .translated_sql
+        .contains("ALTER COLUMN \"visitor_count_visits\" SET DEFAULT 0"));
+    assert!(result
+        .translated_sql
+        .contains("ADD CHECK (visitor_count_visits >= 0 AND visitor_count_visits <= 4294967295)"));
+    assert!(result
+        .translated_sql
+        .contains("ALTER COLUMN \"config_device_model\" TYPE VARCHAR(100)"));
+    assert!(!result.translated_sql.contains("UNSIGNED"));
+    assert!(!result.translated_sql.contains("CHARACTER SET"));
+    assert!(!result.translated_sql.contains("COLLATE"));
+}
+
+#[test]
+fn alter_table_add_index_translation_smoke() {
+    let sql = "ALTER TABLE `matomo_log_link_visit_action` ADD COLUMN `server_time` DATETIME NOT NULL, ADD INDEX index_idsite_servertime ( idsite, server_time ), ADD COLUMN `idpageview` CHAR(6) NULL DEFAULT NULL, ADD COLUMN `idaction_name` INTEGER(10) UNSIGNED, ADD COLUMN `time_dom_completion` MEDIUMINT(10) UNSIGNED NULL;";
+    let result = translate_sql(sql, &TranslatorConfig::default()).unwrap();
+
+    assert!(result
+        .translated_sql
+        .contains("ALTER TABLE \"matomo_log_link_visit_action\" ADD COLUMN \"server_time\" TIMESTAMP NOT NULL"));
+    assert!(result
+        .translated_sql
+        .contains("ADD COLUMN \"idpageview\" CHAR(6) NULL DEFAULT NULL"));
+    assert!(result
+        .translated_sql
+        .contains("ADD COLUMN \"idaction_name\" BIGINT"));
+    assert!(result
+        .translated_sql
+        .contains("ADD CHECK (\"idaction_name\" >= 0 AND \"idaction_name\" <= 4294967295)"));
+    assert!(result
+        .translated_sql
+        .contains("ADD CHECK (\"time_dom_completion\" >= 0 AND \"time_dom_completion\" <= 16777215)"));
+    assert!(result.translated_sql.contains(
+        "CREATE INDEX \"matomo_log_link_visit_action_index_idsite_servertime\" ON \"matomo_log_link_visit_action\" (\"idsite\", \"server_time\")"
+    ));
+    assert!(!result.translated_sql.contains("ADD INDEX"));
+    assert!(!result.translated_sql.contains("UNSIGNED"));
+}
+
+#[test]
+fn alter_table_drop_index_translation_smoke() {
+    let sql = "ALTER TABLE `matomo_log_link_visit_action` DROP INDEX index_idsite_servertime;";
+    let result = translate_sql(sql, &TranslatorConfig::default()).unwrap();
+
+    assert_eq!(
+        result.translated_sql,
+        "DROP INDEX \"matomo_log_link_visit_action_index_idsite_servertime\""
+    );
+    assert!(!result.translated_sql.contains("ALTER TABLE"));
+}
+
+#[test]
 fn create_table_with_desc_inline_key_translation_smoke() {
     let sql = r#"
         CREATE TABLE log_visit (

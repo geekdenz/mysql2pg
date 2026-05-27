@@ -1213,9 +1213,33 @@ fn translate_alter_table(
     }
 
     let mut operations = Vec::new();
+    let mut post_statements = Vec::new();
 
     for operation in &alter.operations {
         match operation {
+            AlterTableOperation::AddConstraint {
+                constraint: TableConstraint::Index(index),
+                not_valid,
+            } => {
+                if *not_valid {
+                    return Err(MiddlewareError::Translation(format!(
+                        "MySQL ADD INDEX `{}` cannot be marked NOT VALID in PostgreSQL translation",
+                        index.name.as_ref().map(|n| n.to_string()).unwrap_or_else(|| "<unnamed>".to_string())
+                    )));
+                }
+                post_statements.push(translate_inline_index(index, &alter.name)?);
+                warnings.push(format!(
+                    "rewrote MySQL ALTER TABLE ADD KEY/INDEX `{}` to a separate PostgreSQL CREATE INDEX statement",
+                    index.name.as_ref().map(|n| n.to_string()).unwrap_or_else(|| "<unnamed>".to_string())
+                ));
+            }
+            AlterTableOperation::AddConstraint {
+                constraint,
+                not_valid,
+            } => {
+                let not_valid = if *not_valid { " NOT VALID" } else { "" };
+                operations.push(format!("ADD {}{not_valid}", translate_table_constraint(constraint)?));
+            }
             AlterTableOperation::AddColumn {
                 if_not_exists,
                 column_def,
@@ -1235,6 +1259,30 @@ fn translate_alter_table(
                     ));
                 }
             }
+            AlterTableOperation::ModifyColumn {
+                col_name,
+                data_type,
+                options,
+                column_position,
+            } => {
+                operations.extend(translate_modify_column(
+                    col_name,
+                    data_type,
+                    options,
+                    column_position.as_ref(),
+                    warnings,
+                )?);
+            }
+            AlterTableOperation::DropIndex { name } => {
+                post_statements.push(format!(
+                    "DROP INDEX {}",
+                    quote_ident(&prefixed_index_name(&alter.name, Some(&name.to_string()), "idx"))
+                ));
+                warnings.push(format!(
+                    "rewrote MySQL ALTER TABLE DROP INDEX `{}` to a separate PostgreSQL DROP INDEX statement",
+                    name
+                ));
+            }
             other => operations.push(other.to_string()),
         }
     }
@@ -1242,11 +1290,113 @@ fn translate_alter_table(
     let if_exists = if alter.if_exists { "IF EXISTS " } else { "" };
     let only = if alter.only { "ONLY " } else { "" };
 
-    Ok(format!(
-        "ALTER TABLE {if_exists}{only}{} {}",
-        quote_object_name(&alter.name),
-        operations.join(", ")
-    ))
+    let mut statements = Vec::new();
+    if !operations.is_empty() {
+        statements.push(format!(
+            "ALTER TABLE {if_exists}{only}{} {}",
+            quote_object_name(&alter.name),
+            operations.join(", ")
+        ));
+    }
+    statements.extend(post_statements);
+
+    if statements.is_empty() {
+        return Err(MiddlewareError::Translation(
+            "ALTER TABLE statement did not contain translatable operations".to_string(),
+        ));
+    }
+
+    Ok(statements.join("; "))
+}
+
+fn translate_modify_column(
+    col_name: &sqlparser::ast::Ident,
+    data_type: &DataType,
+    options: &[ColumnOption],
+    column_position: Option<&sqlparser::ast::MySQLColumnPosition>,
+    warnings: &mut Vec<String>,
+) -> Result<Vec<String>, MiddlewareError> {
+    let mut extra_constraints = Vec::new();
+    let translated_type = translate_data_type(
+        &col_name.value,
+        data_type,
+        &mut extra_constraints,
+        warnings,
+    );
+    let quoted_name = quote_ident(&col_name.value);
+    let mut operations = vec![format!("ALTER COLUMN {quoted_name} TYPE {translated_type}")];
+    let mut nullability = None;
+    let mut default = None;
+    let mut saw_default = false;
+
+    for option in options {
+        match option {
+            ColumnOption::Null => nullability = Some(true),
+            ColumnOption::NotNull => nullability = Some(false),
+            ColumnOption::Default(expr) => {
+                saw_default = true;
+                default = Some(expr.to_string());
+            }
+            ColumnOption::CharacterSet(_) | ColumnOption::Collation(_) => {
+                warnings.push(format!(
+                    "dropped MySQL character set/collation option from ALTER TABLE MODIFY COLUMN `{}`",
+                    col_name
+                ));
+            }
+            ColumnOption::Comment(_) => {
+                warnings.push(format!(
+                    "dropped MySQL column comment from ALTER TABLE MODIFY COLUMN `{}`",
+                    col_name
+                ));
+            }
+            ColumnOption::OnUpdate(_) => {
+                warnings.push(format!(
+                    "dropped MySQL ON UPDATE clause from ALTER TABLE MODIFY COLUMN `{}`; PostgreSQL requires a trigger for equivalent behavior",
+                    col_name
+                ));
+            }
+            ColumnOption::DialectSpecific(tokens) if is_auto_increment(tokens) => {
+                return Err(MiddlewareError::Translation(format!(
+                    "AUTO_INCREMENT cannot be applied by ALTER TABLE MODIFY COLUMN `{}` without recreating identity metadata",
+                    col_name
+                )));
+            }
+            other => {
+                return Err(MiddlewareError::Translation(format!(
+                    "ALTER TABLE MODIFY COLUMN `{}` option `{}` is not supported yet",
+                    col_name, other
+                )));
+            }
+        }
+    }
+
+    match nullability {
+        Some(false) => operations.push(format!("ALTER COLUMN {quoted_name} SET NOT NULL")),
+        Some(true) => operations.push(format!("ALTER COLUMN {quoted_name} DROP NOT NULL")),
+        None => operations.push(format!("ALTER COLUMN {quoted_name} DROP NOT NULL")),
+    }
+
+    if saw_default {
+        operations.push(format!(
+            "ALTER COLUMN {quoted_name} SET DEFAULT {}",
+            default.unwrap_or_else(|| "NULL".to_string())
+        ));
+    } else {
+        operations.push(format!("ALTER COLUMN {quoted_name} DROP DEFAULT"));
+    }
+
+    for constraint in extra_constraints {
+        operations.push(format!("ADD {constraint}"));
+    }
+
+    if column_position.is_some() {
+        warnings.push(format!(
+            "dropped MySQL column position clause from ALTER TABLE MODIFY COLUMN `{}`",
+            col_name
+        ));
+    }
+
+    Ok(operations)
 }
 
 fn translate_table_constraint(constraint: &TableConstraint) -> Result<String, MiddlewareError> {
@@ -1366,20 +1516,11 @@ fn translate_inline_index(index: &IndexConstraint, table_name: &ObjectName) -> R
         )));
     }
 
-    let table_index_prefix = sanitize_identifier_for_index_name(&object_name_tail(table_name));
     let index_name = index
         .name
         .as_ref()
-        .map(ToString::to_string)
-        .map(|name| {
-            let sanitized = sanitize_identifier_for_index_name(&name);
-            if sanitized.starts_with(&format!("{table_index_prefix}_")) {
-                sanitized
-            } else {
-                format!("{table_index_prefix}_{sanitized}")
-            }
-        })
-        .unwrap_or_else(|| format!("{table_index_prefix}_idx"));
+        .map(ToString::to_string);
+    let index_name = prefixed_index_name(table_name, index_name.as_deref(), "idx");
     let columns = index
         .columns
         .iter()
@@ -1436,21 +1577,12 @@ fn translate_unique_constraint_as_index(
         )));
     }
 
-    let table_index_prefix = sanitize_identifier_for_index_name(&object_name_tail(table_name));
     let index_name = unique
         .index_name
         .as_ref()
         .or(unique.name.as_ref())
-        .map(ToString::to_string)
-        .map(|name| {
-            let sanitized = sanitize_identifier_for_index_name(&name);
-            if sanitized.starts_with(&format!("{table_index_prefix}_")) {
-                sanitized
-            } else {
-                format!("{table_index_prefix}_{sanitized}")
-            }
-        })
-        .unwrap_or_else(|| format!("{table_index_prefix}_uniq_idx"));
+        .map(ToString::to_string);
+    let index_name = prefixed_index_name(table_name, index_name.as_deref(), "uniq_idx");
     let columns = unique
         .columns
         .iter()
@@ -1470,6 +1602,20 @@ fn object_name_tail(name: &ObjectName) -> String {
         .last()
         .map(ToString::to_string)
         .unwrap_or_else(|| name.to_string())
+}
+
+fn prefixed_index_name(table_name: &ObjectName, index_name: Option<&str>, fallback_suffix: &str) -> String {
+    let table_index_prefix = sanitize_identifier_for_index_name(&object_name_tail(table_name));
+    index_name
+        .map(sanitize_identifier_for_index_name)
+        .map(|sanitized| {
+            if sanitized.starts_with(&format!("{table_index_prefix}_")) {
+                sanitized
+            } else {
+                format!("{table_index_prefix}_{sanitized}")
+            }
+        })
+        .unwrap_or_else(|| format!("{table_index_prefix}_{fallback_suffix}"))
 }
 
 fn sanitize_identifier_for_index_name(name: &str) -> String {
