@@ -1,6 +1,7 @@
 use async_trait::async_trait;
 use serde::Serialize;
 use bytes::BytesMut;
+use tokio::sync::Mutex;
 use tokio_postgres::{
     types::{to_sql_checked, Format, IsNull, ToSql, Type},
     NoTls, SimpleQueryMessage,
@@ -333,6 +334,326 @@ impl PostgresExecutor for TokioPostgresExecutor {
     }
 }
 
+pub struct SessionPostgresExecutor {
+    connection_string: String,
+    client: Mutex<Option<tokio_postgres::Client>>,
+}
+
+impl SessionPostgresExecutor {
+    pub fn new(connection_string: String) -> Self {
+        Self {
+            connection_string,
+            client: Mutex::new(None),
+        }
+    }
+
+    async fn acquire(&self) -> Result<tokio::sync::MutexGuard<'_, Option<tokio_postgres::Client>>, MiddlewareError> {
+        let mut guard = self.client.lock().await;
+        let needs_connect = guard.as_ref().map(|c| c.is_closed()).unwrap_or(true);
+        if needs_connect {
+            let (client, connection) = tokio_postgres::connect(&self.connection_string, NoTls)
+                .await
+                .map_err(|e| MiddlewareError::Execution(format!("failed to connect to PostgreSQL: {}", format_pg_error(&e))))?;
+            tokio::spawn(async move {
+                if let Err(err) = connection.await {
+                    eprintln!("postgres connection error: {err}");
+                }
+            });
+            *guard = Some(client);
+        }
+        Ok(guard)
+    }
+
+    async fn set_schema(client: &tokio_postgres::Client, schema: Option<&str>) -> Result<(), MiddlewareError> {
+        if let Some(schema) = schema.filter(|s| !s.trim().is_empty()) {
+            let search_path = format!("SET search_path TO {}, public", quote_ident(schema));
+            client
+                .batch_execute(&search_path)
+                .await
+                .map_err(|e| MiddlewareError::Execution(format!("failed to set schema: {}", format_pg_error(&e))))?;
+        }
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl PostgresExecutor for SessionPostgresExecutor {
+    async fn execute_sql(&self, sql: &str) -> Result<QueryResult, MiddlewareError> {
+        self.execute_sql_in_schema(None, sql).await
+    }
+
+    async fn execute_sql_in_schema(
+        &self,
+        schema: Option<&str>,
+        sql: &str,
+    ) -> Result<QueryResult, MiddlewareError> {
+        let guard = self.acquire().await?;
+        let client = guard.as_ref().unwrap();
+        Self::set_schema(client, schema).await?;
+
+        let sql_upper = sql.trim_start().to_uppercase();
+        let returns_rows = sql_upper.starts_with("SELECT")
+            || sql_upper.starts_with("WITH")
+            || sql_upper.starts_with("SHOW")
+            || sql_upper.starts_with("VALUES");
+
+        let result = if !returns_rows {
+            if let Some((table_name, identity_column)) = find_identity_insert_target(client, sql).await? {
+                let wrapped_sql = wrap_insert_returning_sql(sql, &identity_column);
+                let row = client
+                    .query_one(&wrapped_sql, &[])
+                    .await
+                    .map_err(|e| MiddlewareError::Execution(format!("statement failed: {}", format_pg_error(&e))))?;
+                let row_count = row.try_get::<usize, i64>(0).unwrap_or_default().max(0) as u64;
+                let last_insert_id = row.try_get::<usize, i64>(1).unwrap_or_default().max(0) as u64;
+                tracing::debug!(
+                    "captured insert id for {}.{} => row_count={} last_insert_id={}",
+                    table_name,
+                    identity_column,
+                    row_count,
+                    last_insert_id
+                );
+                Ok(QueryResult {
+                    columns: vec![],
+                    rows: vec![],
+                    row_count,
+                    last_insert_id,
+                })
+            } else {
+                let messages = client
+                    .simple_query(sql)
+                    .await
+                    .map_err(|e| MiddlewareError::Execution(format!("statement failed: {}", format_pg_error(&e))))?;
+                let affected = messages
+                    .into_iter()
+                    .filter_map(|message| match message {
+                        SimpleQueryMessage::CommandComplete(rows) => Some(rows),
+                        _ => None,
+                    })
+                    .sum();
+                Ok(QueryResult {
+                    columns: vec![],
+                    rows: vec![],
+                    row_count: affected,
+                    last_insert_id: 0,
+                })
+            }
+        } else {
+            let messages = client
+                .simple_query(sql)
+                .await
+                .map_err(|e| MiddlewareError::Execution(format!("query failed: {}", format_pg_error(&e))))?;
+
+            let mut columns = Vec::new();
+            let mut rendered_rows = Vec::new();
+            for message in messages {
+                match message {
+                    SimpleQueryMessage::RowDescription(description) if columns.is_empty() => {
+                        columns = description.iter().map(|column| column.name().to_string()).collect();
+                    }
+                    SimpleQueryMessage::Row(row) => {
+                        if columns.is_empty() {
+                            columns = row.columns().iter().map(|column| column.name().to_string()).collect();
+                        }
+                        rendered_rows.push(
+                            row.columns()
+                                .iter()
+                                .enumerate()
+                                .map(|(idx, _)| row.get(idx).unwrap_or_default().to_string())
+                                .collect::<Vec<_>>(),
+                        );
+                    }
+                    _ => {}
+                }
+            }
+
+            Ok(QueryResult {
+                row_count: rendered_rows.len() as u64,
+                columns,
+                rows: rendered_rows,
+                last_insert_id: 0,
+            })
+        };
+
+        result
+    }
+
+    async fn execute_prepared_sql(
+        &self,
+        sql: &str,
+        params: &[PgParam],
+    ) -> Result<QueryResult, MiddlewareError> {
+        self.execute_prepared_sql_in_schema(None, sql, params).await
+    }
+
+    async fn execute_prepared_sql_in_schema(
+        &self,
+        schema: Option<&str>,
+        sql: &str,
+        params: &[PgParam],
+    ) -> Result<QueryResult, MiddlewareError> {
+        let guard = self.acquire().await?;
+        let client = guard.as_ref().unwrap();
+        Self::set_schema(client, schema).await?;
+
+        let statement = client
+            .prepare(sql)
+            .await
+            .map_err(|e| MiddlewareError::Execution(format!("statement preparation failed: {}", format_pg_error(&e))))?;
+        let bind_params = params.iter().map(|param| param as &(dyn ToSql + Sync)).collect::<Vec<_>>();
+
+        let result = if statement.columns().is_empty() {
+            if let Some((table_name, identity_column)) = find_identity_insert_target(client, sql).await? {
+                let wrapped_sql = wrap_insert_returning_sql(sql, &identity_column);
+                let wrapped_statement = client
+                    .prepare(&wrapped_sql)
+                    .await
+                    .map_err(|e| MiddlewareError::Execution(format!("statement preparation failed: {}", format_pg_error(&e))))?;
+                let row = client
+                    .query_one(&wrapped_statement, &bind_params)
+                    .await
+                    .map_err(|e| MiddlewareError::Execution(format!("statement failed: {}", format_pg_error(&e))))?;
+                let row_count = row.try_get::<usize, i64>(0).unwrap_or_default().max(0) as u64;
+                let last_insert_id = row.try_get::<usize, i64>(1).unwrap_or_default().max(0) as u64;
+                tracing::debug!(
+                    "captured insert id for {}.{} => row_count={} last_insert_id={}",
+                    table_name,
+                    identity_column,
+                    row_count,
+                    last_insert_id
+                );
+                Ok(QueryResult {
+                    columns: Vec::new(),
+                    rows: Vec::new(),
+                    row_count,
+                    last_insert_id,
+                })
+            } else {
+                let affected = client
+                    .execute(&statement, &bind_params)
+                    .await
+                    .map_err(|e| MiddlewareError::Execution(format!("statement failed: {}", format_pg_error(&e))))?;
+                Ok(QueryResult {
+                    columns: Vec::new(),
+                    rows: Vec::new(),
+                    row_count: affected,
+                    last_insert_id: 0,
+                })
+            }
+        } else {
+            let rows = client
+                .query(&statement, &bind_params)
+                .await
+                .map_err(|e| MiddlewareError::Execution(format!("query failed: {}", format_pg_error(&e))))?;
+            let columns = statement
+                .columns()
+                .iter()
+                .map(|column| column.name().to_string())
+                .collect::<Vec<_>>();
+            let rendered_rows = rows
+                .iter()
+                .map(|row| {
+                    row.columns()
+                        .iter()
+                        .enumerate()
+                        .map(|(idx, column)| value_to_string(row, idx, column.type_()))
+                        .collect::<Vec<_>>()
+                })
+                .collect::<Vec<_>>();
+
+            Ok(QueryResult {
+                row_count: rendered_rows.len() as u64,
+                columns,
+                rows: rendered_rows,
+                last_insert_id: 0,
+            })
+        };
+
+        drop(statement);
+        result
+    }
+
+    async fn describe_sql(&self, sql: &str) -> Result<Vec<String>, MiddlewareError> {
+        self.describe_sql_in_schema(None, sql).await
+    }
+
+    async fn describe_sql_in_schema(
+        &self,
+        schema: Option<&str>,
+        sql: &str,
+    ) -> Result<Vec<String>, MiddlewareError> {
+        let guard = self.acquire().await?;
+        let client = guard.as_ref().unwrap();
+        Self::set_schema(client, schema).await?;
+
+        let messages = client
+            .simple_query(sql)
+            .await
+            .map_err(|e| MiddlewareError::Execution(format!("query description failed: {}", format_pg_error(&e))))?;
+
+        for message in messages {
+            match message {
+                SimpleQueryMessage::RowDescription(description) => {
+                    return Ok(description.iter().map(|column| column.name().to_string()).collect())
+                }
+                SimpleQueryMessage::Row(row) => {
+                    return Ok(row.columns().iter().map(|column| column.name().to_string()).collect())
+                }
+                _ => {}
+            }
+        }
+
+        Ok(Vec::new())
+    }
+
+    async fn describe_prepared_sql(&self, sql: &str) -> Result<Vec<String>, MiddlewareError> {
+        self.describe_prepared_sql_in_schema(None, sql).await
+    }
+
+    async fn describe_prepared_sql_in_schema(
+        &self,
+        schema: Option<&str>,
+        sql: &str,
+    ) -> Result<Vec<String>, MiddlewareError> {
+        let guard = self.acquire().await?;
+        let client = guard.as_ref().unwrap();
+        Self::set_schema(client, schema).await?;
+
+        let statement = client
+            .prepare(sql)
+            .await
+            .map_err(|e| MiddlewareError::Execution(format!("statement description failed: {}", format_pg_error(&e))))?;
+
+        Ok(statement
+            .columns()
+            .iter()
+            .map(|column| column.name().to_string())
+            .collect())
+    }
+
+    async fn create_schema(&self, schema: &str) -> Result<(), MiddlewareError> {
+        let guard = self.acquire().await?;
+        let client = guard.as_ref().unwrap();
+        let sql = format!("CREATE SCHEMA IF NOT EXISTS {}", quote_ident(schema));
+        client
+            .batch_execute(&sql)
+            .await
+            .map_err(|e| MiddlewareError::Execution(format!("schema creation failed: {}", format_pg_error(&e))))?;
+        Ok(())
+    }
+
+    async fn drop_schema(&self, schema: &str) -> Result<(), MiddlewareError> {
+        let guard = self.acquire().await?;
+        let client = guard.as_ref().unwrap();
+        let sql = format!("DROP SCHEMA IF EXISTS {} CASCADE", quote_ident(schema));
+        client
+            .batch_execute(&sql)
+            .await
+            .map_err(|e| MiddlewareError::Execution(format!("schema drop failed: {}", format_pg_error(&e))))?;
+        Ok(())
+    }
+}
+
 impl ToSql for PgParam {
     fn to_sql(
         &self,
@@ -499,6 +820,15 @@ pub fn build_executor(cfg: &AppConfig) -> Result<std::sync::Arc<dyn PostgresExec
         "tokio-postgres" => Ok(std::sync::Arc::new(TokioPostgresExecutor::new(
             cfg.postgres.connection_string.clone(),
         ))),
+        other => Err(MiddlewareError::Config(format!(
+            "unsupported postgres driver `{other}`; currently supported: tokio-postgres"
+        ))),
+    }
+}
+
+pub fn connection_string_for_config(cfg: &AppConfig) -> Result<String, MiddlewareError> {
+    match cfg.postgres.driver.as_str() {
+        "tokio-postgres" => Ok(cfg.postgres.connection_string.clone()),
         other => Err(MiddlewareError::Config(format!(
             "unsupported postgres driver `{other}`; currently supported: tokio-postgres"
         ))),

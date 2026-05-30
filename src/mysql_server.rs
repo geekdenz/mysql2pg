@@ -20,7 +20,7 @@ use tokio::{io::split, net::TcpListener};
 use crate::{
     config::AppConfig,
     error::MiddlewareError,
-    executor::{PgParam, PostgresExecutor, QueryResult},
+    executor::{PgParam, PostgresExecutor, QueryResult, SessionPostgresExecutor},
     parser::parse_mysql_sql,
     translator::{translate_sql, TranslationResult},
 };
@@ -57,18 +57,18 @@ impl From<MiddlewareError> for MySqlServerError {
 #[derive(Clone)]
 pub struct MySqlFrontendFactory {
     config: Arc<AppConfig>,
-    executor: Arc<dyn PostgresExecutor>,
+    connection_string: String,
 }
 
 impl MySqlFrontendFactory {
-    pub fn new(config: Arc<AppConfig>, executor: Arc<dyn PostgresExecutor>) -> Self {
-        Self { config, executor }
+    pub fn new(config: Arc<AppConfig>, connection_string: String) -> Self {
+        Self { config, connection_string }
     }
 
     fn connection_backend(&self) -> MySqlBackend {
         MySqlBackend {
             config: self.config.clone(),
-            executor: self.executor.clone(),
+            executor: Arc::new(SessionPostgresExecutor::new(self.connection_string.clone())),
             next_statement_id: 1,
             prepared: HashMap::new(),
             connection_id: NEXT_CONNECTION_ID.fetch_add(1, Ordering::Relaxed),

@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     config::AppConfig,
-    executor::{build_executor, PostgresExecutor, QueryResult},
+    executor::{build_executor, connection_string_for_config, PostgresExecutor, QueryResult},
     mysql_server::{serve_mysql, MySqlFrontendFactory},
     translator::{translate_sql, TranslationResult},
 };
@@ -50,6 +50,7 @@ pub async fn serve(config: AppConfig) -> anyhow::Result<()> {
     let mysql_bind_addr = config.server.mysql_bind_addr.clone();
     let shared_config = Arc::new(config);
     let executor = build_executor(shared_config.as_ref())?;
+    let connection_string = connection_string_for_config(shared_config.as_ref())?;
 
     let http_state = AppState {
         executor: executor.clone(),
@@ -63,7 +64,7 @@ pub async fn serve(config: AppConfig) -> anyhow::Result<()> {
         .with_state(http_state);
 
     let http_listener = tokio::net::TcpListener::bind(&http_bind_addr).await?;
-    let mysql_factory = MySqlFrontendFactory::new(shared_config.clone(), executor);
+    let mysql_factory = MySqlFrontendFactory::new(shared_config.clone(), connection_string);
 
     tracing::info!("http frontend listening on {}", http_bind_addr);
     tracing::info!("mysql-compatible frontend listening on {}", mysql_bind_addr);
