@@ -2185,6 +2185,7 @@ fn strip_mysql_table_options(sql: &str, warnings: &mut Vec<String>) -> String {
 }
 
 fn reject_unsupported(sql: &str) -> Result<(), MiddlewareError> {
+    let sql_without_quoted_values = mask_quoted_sql_fragments(sql);
     let unsupported = [
         (r"(?i)\bREPLACE\s+INTO\b", "REPLACE INTO is MySQL-specific; use INSERT ... ON CONFLICT in PostgreSQL"),
         (r"(?i)\bON\s+DUPLICATE\s+KEY\s+UPDATE\b", "ON DUPLICATE KEY UPDATE needs table/key-specific ON CONFLICT translation"),
@@ -2197,12 +2198,49 @@ fn reject_unsupported(sql: &str) -> Result<(), MiddlewareError> {
 
     for (pattern, message) in unsupported {
         let re = Regex::new(pattern).expect("valid regex");
-        if re.is_match(sql) {
+        if re.is_match(&sql_without_quoted_values) {
             return Err(MiddlewareError::Translation(message.to_string()));
         }
     }
 
     Ok(())
+}
+
+fn mask_quoted_sql_fragments(sql: &str) -> String {
+    let mut masked = String::with_capacity(sql.len());
+    let mut chars = sql.chars().peekable();
+
+    while let Some(ch) = chars.next() {
+        match ch {
+            '\'' | '"' => {
+                let quote = ch;
+                masked.push(' ');
+
+                while let Some(inner) = chars.next() {
+                    masked.push(' ');
+
+                    if inner == '\\' {
+                        if chars.next().is_some() {
+                            masked.push(' ');
+                        }
+                        continue;
+                    }
+
+                    if inner == quote {
+                        if chars.peek() == Some(&quote) {
+                            chars.next();
+                            masked.push(' ');
+                            continue;
+                        }
+                        break;
+                    }
+                }
+            }
+            _ => masked.push(ch),
+        }
+    }
+
+    masked
 }
 
 #[cfg(test)]

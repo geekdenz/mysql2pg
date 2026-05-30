@@ -306,6 +306,19 @@ fn alter_table_drop_index_translation_smoke() {
 }
 
 #[test]
+fn matomo_dimension_version_update_allows_mysql_type_text() {
+    let sql = "UPDATE `matomo_option` SET option_value = 'INTEGER(10) UNSIGNED DEFAULT NULL', autoload = '1' WHERE option_name = 'version_log_link_visit_action.idaction_url'";
+    let result = translate_sql(sql, &TranslatorConfig::default()).unwrap();
+
+    assert!(result
+        .translated_sql
+        .contains("\"matomo_option\" SET option_value = 'INTEGER(10) UNSIGNED DEFAULT NULL'"));
+    assert!(result
+        .translated_sql
+        .contains("option_name = 'version_log_link_visit_action.idaction_url'"));
+}
+
+#[test]
 fn create_table_with_desc_inline_key_translation_smoke() {
     let sql = r#"
         CREATE TABLE log_visit (
