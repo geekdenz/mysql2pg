@@ -941,7 +941,10 @@ fn translate_insert_on_duplicate_key_direct(
         .into_iter()
         .map(|column| normalize_identifier_token(&column))
         .collect::<Result<Vec<_>, _>>()?;
-    let values = split_sql_csv(raw_values)?;
+    let values = split_sql_csv(raw_values)?
+        .into_iter()
+        .map(|value| normalize_mysql_string_literals(&value))
+        .collect::<Vec<_>>();
     if columns.is_empty() || columns.len() != values.len() {
         return Err(MiddlewareError::Translation(
             "INSERT ... ON DUPLICATE KEY UPDATE requires matching column and value counts"
@@ -1006,6 +1009,12 @@ fn split_sql_csv(input: &str) -> Result<Vec<String>, MiddlewareError> {
 
     while let Some(ch) = chars.next() {
         match ch {
+            '\\' if in_single || in_double => {
+                current.push(ch);
+                if let Some(next) = chars.next() {
+                    current.push(next);
+                }
+            }
             '\'' if !in_double && !in_backtick => {
                 current.push(ch);
                 if in_single {
@@ -1088,7 +1097,64 @@ fn parse_update_assignment(assignment: &str) -> Result<(String, String), Middlew
     let right = parts
         .next()
         .ok_or_else(|| MiddlewareError::Translation("missing update assignment value".to_string()))?;
-    Ok((normalize_identifier_token(left)?, right.trim().to_string()))
+    Ok((
+        normalize_identifier_token(left)?,
+        normalize_mysql_string_literals(right.trim()),
+    ))
+}
+
+fn normalize_mysql_string_literals(sql: &str) -> String {
+    let mut normalized = String::with_capacity(sql.len());
+    let mut chars = sql.chars().peekable();
+
+    while let Some(ch) = chars.next() {
+        if ch != '\'' && ch != '"' {
+            normalized.push(ch);
+            continue;
+        }
+
+        let quote = ch;
+        let mut value = String::new();
+
+        while let Some(inner) = chars.next() {
+            if inner == '\\' {
+                match chars.next() {
+                    Some('0') => value.push('\0'),
+                    Some('b') => value.push('\u{0008}'),
+                    Some('n') => value.push('\n'),
+                    Some('r') => value.push('\r'),
+                    Some('t') => value.push('\t'),
+                    Some('Z') => value.push('\u{001a}'),
+                    Some(next @ ('\'' | '"' | '\\')) => value.push(next),
+                    Some(next) => {
+                        value.push('\\');
+                        value.push(next);
+                    }
+                    None => value.push('\\'),
+                }
+                continue;
+            }
+
+            if inner == quote {
+                if chars.peek() == Some(&quote) {
+                    chars.next();
+                    value.push(quote);
+                    continue;
+                }
+                break;
+            }
+
+            value.push(inner);
+        }
+
+        normalized.push_str(&postgres_string_literal(&value));
+    }
+
+    normalized
+}
+
+fn postgres_string_literal(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
 }
 
 fn infer_on_conflict_target(

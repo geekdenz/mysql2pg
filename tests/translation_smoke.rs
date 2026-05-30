@@ -31,6 +31,31 @@ fn on_duplicate_key_update_translation_smoke() {
 }
 
 #[test]
+fn on_duplicate_key_update_normalizes_mysql_escaped_string_literals() {
+    let sql = r#"INSERT INTO matomo_session (id, modified, lifetime, data) VALUES ('abc', '1780099497', '1209600', 'a:1:{s:4:\"data\";s:5:\"hello\";}') ON DUPLICATE KEY UPDATE modified = '1780099497', lifetime = '1209600', data = 'a:1:{s:4:\"data\";s:5:\"hello\";}'"#;
+    let result = translate_sql(sql, &TranslatorConfig::default()).unwrap();
+
+    assert!(result
+        .translated_sql
+        .contains("'a:1:{s:4:\"data\";s:5:\"hello\";}'"));
+    assert!(!result.translated_sql.contains(r#"\"data\""#));
+    assert!(result
+        .translated_sql
+        .contains("ON CONFLICT (\"id\") DO UPDATE SET"));
+}
+
+#[test]
+fn on_duplicate_key_update_keeps_escaped_literal_commas_in_one_value() {
+    let sql = r#"INSERT INTO matomo_session (id, data) VALUES ('abc', 'can\'t, split') ON DUPLICATE KEY UPDATE data = 'can\'t, split'"#;
+    let result = translate_sql(sql, &TranslatorConfig::default()).unwrap();
+
+    assert!(result.translated_sql.contains("'can''t, split'"));
+    assert!(result
+        .translated_sql
+        .contains("ON CONFLICT (\"id\") DO UPDATE SET"));
+}
+
+#[test]
 fn insert_ignore_translation_smoke() {
     let sql = "INSERT IGNORE INTO `option` (option_name, option_value, autoload) VALUES ('a', 'b', 'c')";
     let result = translate_sql(sql, &TranslatorConfig::default()).unwrap();
