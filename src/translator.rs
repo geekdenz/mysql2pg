@@ -19,10 +19,11 @@ pub struct TranslationResult {
 }
 
 pub fn translate_sql(sql: &str, cfg: &TranslatorConfig) -> Result<TranslationResult, MiddlewareError> {
-    let direct_translation = translate_unparsed_sql(sql)?;
+    let mysql_sql = normalize_mysql_double_quoted_string_literals(sql);
+    let direct_translation = translate_unparsed_sql(&mysql_sql)?;
     let statements = match direct_translation.as_ref() {
         Some(_) => Vec::new(),
-        None => parse_mysql_sql(sql)?,
+        None => parse_mysql_sql(&mysql_sql)?,
     };
     if statements.is_empty() {
         if let Some((canonical_mysql_sql, mut translated, mut warnings)) = direct_translation {
@@ -138,6 +139,73 @@ fn replace_backticks(sql: &str) -> String {
     sql.replace('`', "\"")
 }
 
+fn normalize_mysql_double_quoted_string_literals(sql: &str) -> String {
+    let mut normalized = String::with_capacity(sql.len());
+    let mut chars = sql.chars().peekable();
+
+    while let Some(ch) = chars.next() {
+        match ch {
+            '\'' | '`' => {
+                let quote = ch;
+                normalized.push(ch);
+                while let Some(inner) = chars.next() {
+                    normalized.push(inner);
+                    if inner == '\\' {
+                        if let Some(next) = chars.next() {
+                            normalized.push(next);
+                        }
+                        continue;
+                    }
+                    if inner == quote {
+                        if chars.peek() == Some(&quote) {
+                            if let Some(next) = chars.next() {
+                                normalized.push(next);
+                            }
+                            continue;
+                        }
+                        break;
+                    }
+                }
+            }
+            '"' => {
+                let mut value = String::new();
+                while let Some(inner) = chars.next() {
+                    if inner == '\\' {
+                        match chars.next() {
+                            Some('0') => value.push('\0'),
+                            Some('b') => value.push('\u{0008}'),
+                            Some('n') => value.push('\n'),
+                            Some('r') => value.push('\r'),
+                            Some('t') => value.push('\t'),
+                            Some('Z') => value.push('\u{001a}'),
+                            Some(next @ ('\'' | '"' | '\\')) => value.push(next),
+                            Some(next) => {
+                                value.push('\\');
+                                value.push(next);
+                            }
+                            None => value.push('\\'),
+                        }
+                        continue;
+                    }
+                    if inner == '"' {
+                        if chars.peek() == Some(&'"') {
+                            chars.next();
+                            value.push('"');
+                            continue;
+                        }
+                        break;
+                    }
+                    value.push(inner);
+                }
+                normalized.push_str(&postgres_string_literal(&value));
+            }
+            _ => normalized.push(ch),
+        }
+    }
+
+    normalized
+}
+
 fn quote_reserved_relation_references(sql: &str, warnings: &mut Vec<String>) -> String {
     let reserved_relations = ["user"];
     let patterns = [
@@ -179,7 +247,7 @@ fn quote_reserved_relation_references(sql: &str, warnings: &mut Vec<String>) -> 
 
 fn rewrite_mysql_system_variables(sql: &str, warnings: &mut Vec<String>) -> String {
     let variable_re = Regex::new(
-        r"(?i)@@(?:(?:SESSION|GLOBAL)\.)?(sql_mode|version_comment|version|collation_connection|transaction_isolation|tx_isolation)\b",
+        r"(?i)@@(?:(?:SESSION|GLOBAL)\.)?(sql_mode|version_comment|version|collation_connection|transaction_isolation|tx_isolation|secure_file_priv)\b",
     )
     .expect("valid MySQL system variable regex");
     let version_fn_re = Regex::new(r"(?i)\bVERSION\s*\(\s*\)").expect("valid VERSION() regex");
@@ -196,6 +264,7 @@ fn rewrite_mysql_system_variables(sql: &str, warnings: &mut Vec<String>) -> Stri
             "version_comment" => "'MariaDB Server'".to_string(),
             "collation_connection" => "'utf8mb4_general_ci'".to_string(),
             "transaction_isolation" | "tx_isolation" => "'REPEATABLE-READ'".to_string(),
+            "secure_file_priv" => "NULL::text".to_string(),
             _ => caps[0].to_string(),
         }
     })
@@ -609,6 +678,7 @@ fn translate_show_variables(
                             ('collation_database', 'utf8mb4_unicode_ci'), \
                             ('lower_case_table_names', '0'), \
                             ('max_allowed_packet', '67108864'), \
+                            ('secure_file_priv', NULL), \
                             ('sql_mode', 'NO_AUTO_VALUE_ON_ZERO'), \
                             ('system_time_zone', current_setting('TimeZone')), \
                             ('time_zone', current_setting('TimeZone')), \
@@ -2190,6 +2260,59 @@ fn rewrite_mysql_functions(sql: &str, warnings: &mut Vec<String>) -> String {
         }
     }
 
+    let (rewritten_instr, changed_instr) = rewrite_function_calls(&out, "INSTR", |args| {
+        if args.len() != 2 {
+            return None;
+        }
+        Some(format!(
+            "POSITION(CAST({} AS text) IN CAST({} AS text))",
+            args[1].trim(),
+            args[0].trim()
+        ))
+    });
+    if changed_instr {
+        warnings.push("rewrote MySQL INSTR(str, substr) to PostgreSQL POSITION(substr IN str)".to_string());
+        out = rewritten_instr;
+    }
+
+    let (rewritten_substring_index, changed_substring_index) =
+        rewrite_function_calls(&out, "SUBSTRING_INDEX", |args| {
+            if args.len() != 3 {
+                return None;
+            }
+            let source = args[0].trim();
+            let delimiter = args[1].trim();
+            let count = args[2].trim();
+            if let Some(abs_count) = count.strip_prefix('-') {
+                return Some(format!(
+                    "reverse(split_part(reverse(CAST({source} AS text)), reverse(CAST({delimiter} AS text)), {abs_count}))"
+                ));
+            }
+            Some(format!(
+                "split_part(CAST({source} AS text), CAST({delimiter} AS text), {count})"
+            ))
+        });
+    if changed_substring_index {
+        warnings.push("rewrote MySQL SUBSTRING_INDEX(str, delim, count) to PostgreSQL text operations".to_string());
+        out = rewritten_substring_index;
+    }
+
+    let (rewritten_if, changed_if) = rewrite_function_calls(&out, "IF", |args| {
+        if args.len() != 3 {
+            return None;
+        }
+        Some(format!(
+            "(CASE WHEN {} THEN {} ELSE {} END)",
+            args[0].trim(),
+            args[1].trim(),
+            args[2].trim()
+        ))
+    });
+    if changed_if {
+        warnings.push("rewrote MySQL IF(condition, then, else) to PostgreSQL CASE expression".to_string());
+        out = rewritten_if;
+    }
+
     let unix_ts_re = Regex::new(r"(?i)\bUNIX_TIMESTAMP\s*\(([^\)]*)\)").expect("valid regex");
     if unix_ts_re.is_match(&out) {
         warnings.push("rewrote UNIX_TIMESTAMP(expr) to EXTRACT(EPOCH FROM expr)".to_string());
@@ -2239,6 +2362,121 @@ fn rewrite_mysql_functions(sql: &str, warnings: &mut Vec<String>) -> String {
     }
 
     out
+}
+
+fn rewrite_function_calls<F>(sql: &str, function_name: &str, render: F) -> (String, bool)
+where
+    F: Fn(&[String]) -> Option<String>,
+{
+    let chars = sql.chars().collect::<Vec<_>>();
+    let mut out = String::with_capacity(sql.len());
+    let mut idx = 0usize;
+    let mut changed = false;
+
+    while idx < chars.len() {
+        let ch = chars[idx];
+
+        if matches!(ch, '\'' | '"' | '`') {
+            copy_quoted_fragment(&chars, &mut idx, &mut out);
+            continue;
+        }
+
+        if is_identifier_char(ch) {
+            let token_start = idx;
+            idx += 1;
+            while idx < chars.len() && is_identifier_char(chars[idx]) {
+                idx += 1;
+            }
+
+            let token = chars[token_start..idx].iter().collect::<String>();
+            let mut open_idx = idx;
+            while open_idx < chars.len() && chars[open_idx].is_whitespace() {
+                open_idx += 1;
+            }
+
+            if token.eq_ignore_ascii_case(function_name)
+                && open_idx < chars.len()
+                && chars[open_idx] == '('
+            {
+                if let Some(close_idx) = find_matching_paren(&chars, open_idx) {
+                    let args_sql = chars[open_idx + 1..close_idx].iter().collect::<String>();
+                    if let Ok(args) = split_sql_csv(&args_sql) {
+                        if let Some(replacement) = render(&args) {
+                            out.push_str(&replacement);
+                            idx = close_idx + 1;
+                            changed = true;
+                            continue;
+                        }
+                    }
+                }
+            }
+
+            out.push_str(&token);
+            continue;
+        }
+
+        out.push(ch);
+        idx += 1;
+    }
+
+    (out, changed)
+}
+
+fn copy_quoted_fragment(chars: &[char], idx: &mut usize, out: &mut String) {
+    let quote = chars[*idx];
+    out.push(quote);
+    *idx += 1;
+
+    while *idx < chars.len() {
+        let ch = chars[*idx];
+        out.push(ch);
+        *idx += 1;
+
+        if ch == '\\' {
+            if *idx < chars.len() {
+                out.push(chars[*idx]);
+                *idx += 1;
+            }
+            continue;
+        }
+
+        if ch == quote {
+            if *idx < chars.len() && chars[*idx] == quote {
+                out.push(chars[*idx]);
+                *idx += 1;
+                continue;
+            }
+            break;
+        }
+    }
+}
+
+fn find_matching_paren(chars: &[char], open_idx: usize) -> Option<usize> {
+    let mut idx = open_idx + 1;
+    let mut depth = 1usize;
+
+    while idx < chars.len() {
+        match chars[idx] {
+            '\'' | '"' | '`' => {
+                let mut sink = String::new();
+                copy_quoted_fragment(chars, &mut idx, &mut sink);
+            }
+            '(' => {
+                depth += 1;
+                idx += 1;
+            }
+            ')' => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    return Some(idx);
+                }
+                idx += 1;
+            }
+            _ => idx += 1,
+        }
+    }
+
+    None
 }
 
 fn strip_mysql_select_modifiers(sql: &str, warnings: &mut Vec<String>) -> String {
@@ -2361,7 +2599,7 @@ mod tests {
     #[test]
     fn leaves_string_literals_unchanged_when_normalizing_booleans() {
         let result = translate_sql("SELECT true, false, 'true', \"false_value\" FROM flags", &TranslatorConfig::default()).unwrap();
-        assert!(result.translated_sql.contains("SELECT TRUE, FALSE, 'true', \"false_value\" FROM flags"));
+        assert!(result.translated_sql.contains("SELECT TRUE, FALSE, 'true', 'false_value' FROM flags"));
     }
 
     #[test]

@@ -185,10 +185,43 @@ fn mysql_system_variable_translation_smoke() {
 }
 
 #[test]
+fn mysql_secure_file_priv_variable_translation_smoke() {
+    let result = translate_sql("SELECT @@secure_file_priv", &TranslatorConfig::default()).unwrap();
+    assert_eq!(result.translated_sql, "SELECT NULL::text");
+}
+
+#[test]
 fn show_status_translation_smoke() {
     let result = translate_sql("SHOW STATUS LIKE 'Threads%'", &TranslatorConfig::default()).unwrap();
     assert!(result.translated_sql.contains("pg_stat_activity"));
     assert!(result.translated_sql.contains("\"Variable_name\" LIKE 'Threads%'"));
+}
+
+#[test]
+fn mysql_double_quoted_strings_are_translated_as_strings() {
+    let result = translate_sql(
+        "SELECT count(login) FROM `matomo_user` WHERE login <> \"anonymous\"",
+        &TranslatorConfig::default(),
+    )
+    .unwrap();
+
+    assert!(result
+        .translated_sql
+        .contains("WHERE login <> 'anonymous'"));
+    assert!(!result.translated_sql.contains("\"anonymous\""));
+}
+
+#[test]
+fn mysql_archive_invalidation_functions_are_translated() {
+    let sql = "SELECT COUNT(*) as `count`, IF(INSTR(`name`, '.') > 0, SUBSTRING_INDEX(`name`, '.', -1), NULL) AS plugin, CHAR_LENGTH(IF(INSTR(`name`, '.') > 0, SUBSTRING_INDEX(`name`, '.', 1), `name`)) > 32 AS is_segment_archive FROM `matomo_archive_invalidations` GROUP BY plugin, is_segment_archive";
+    let result = translate_sql(sql, &TranslatorConfig::default()).unwrap();
+
+    assert!(result.translated_sql.contains("CASE WHEN"));
+    assert!(result.translated_sql.contains("POSITION(CAST('.' AS text) IN CAST(\"name\" AS text))"));
+    assert!(result.translated_sql.contains("reverse(split_part(reverse(CAST(\"name\" AS text)), reverse(CAST('.' AS text)), 1))"));
+    assert!(result.translated_sql.contains("split_part(CAST(\"name\" AS text), CAST('.' AS text), 1)"));
+    assert!(!result.translated_sql.contains("INSTR("));
+    assert!(!result.translated_sql.contains("SUBSTRING_INDEX("));
 }
 
 #[test]
