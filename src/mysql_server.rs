@@ -505,6 +505,16 @@ where
             return Ok(());
         }
 
+        if is_load_data_infile(trimmed) {
+            results
+                .error(
+                    ErrorKind::ER_NOT_ALLOWED_COMMAND,
+                    b"The used command is not allowed with this MySQL version",
+                )
+                .await?;
+            return Ok(());
+        }
+
         let translated = match translate_sql(trimmed, &self.config.translator) {
             Ok(result) => result.translated_sql,
             Err(err) => {
@@ -882,6 +892,11 @@ fn dynamic_canned_response_for_system_variable_select(
     });
 
     Some((vec![column_name], vec![vec![value]]))
+}
+
+fn is_load_data_infile(query: &str) -> bool {
+    let upper = query.trim_start().to_ascii_uppercase();
+    upper.starts_with("LOAD DATA LOCAL INFILE") || upper.starts_with("LOAD DATA INFILE")
 }
 
 fn parse_kill_connection_id(query: &str) -> Option<u32> {
