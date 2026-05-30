@@ -937,14 +937,15 @@ fn translate_insert_on_duplicate_key_direct(
         .map(|m| m.as_str())
         .ok_or_else(|| MiddlewareError::Translation("failed to extract INSERT updates".to_string()))?;
 
-    let columns = split_sql_csv(raw_columns)?
+    let mut columns = split_sql_csv(raw_columns)?
         .into_iter()
         .map(|column| normalize_identifier_token(&column))
         .collect::<Result<Vec<_>, _>>()?;
-    let values = split_sql_csv(raw_values)?
+    let mut values = split_sql_csv(raw_values)?
         .into_iter()
         .map(|value| normalize_mysql_string_literals(&value))
         .collect::<Vec<_>>();
+    apply_on_duplicate_insert_defaults(table_name, &mut columns, &mut values);
     if columns.is_empty() || columns.len() != values.len() {
         return Err(MiddlewareError::Translation(
             "INSERT ... ON DUPLICATE KEY UPDATE requires matching column and value counts"
@@ -996,6 +997,23 @@ fn translate_insert_on_duplicate_key_direct(
             conflict_target.join(", ")
         )],
     )))
+}
+
+fn apply_on_duplicate_insert_defaults(
+    table_name: &str,
+    columns: &mut Vec<String>,
+    values: &mut Vec<String>,
+) {
+    if !is_user_language_table(table_name) {
+        return;
+    }
+
+    let has_login = columns.iter().any(|column| column.eq_ignore_ascii_case("login"));
+    let has_language = columns.iter().any(|column| column.eq_ignore_ascii_case("language"));
+    if has_login && !has_language {
+        columns.push("language".to_string());
+        values.push("''".to_string());
+    }
 }
 
 fn split_sql_csv(input: &str) -> Result<Vec<String>, MiddlewareError> {
@@ -1162,7 +1180,7 @@ fn infer_on_conflict_target(
     columns: &[String],
     update_assignments: &[(String, String)],
 ) -> Result<Vec<String>, MiddlewareError> {
-    if table_name.eq_ignore_ascii_case("user_language")
+    if is_user_language_table(table_name)
         && columns.iter().any(|column| column.eq_ignore_ascii_case("login"))
     {
         return Ok(vec!["login".to_string()]);
@@ -1184,6 +1202,13 @@ fn infer_on_conflict_target(
     Err(MiddlewareError::Translation(
         "ON DUPLICATE KEY UPDATE needs table/key-specific ON CONFLICT translation".to_string(),
     ))
+}
+
+fn is_user_language_table(table_name: &str) -> bool {
+    table_name.eq_ignore_ascii_case("user_language")
+        || table_name
+            .to_ascii_lowercase()
+            .ends_with("_user_language")
 }
 
 fn translate_create_table(

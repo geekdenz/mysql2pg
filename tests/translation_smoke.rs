@@ -31,6 +31,19 @@ fn on_duplicate_key_update_translation_smoke() {
 }
 
 #[test]
+fn on_duplicate_key_update_adds_user_language_default_for_prefixed_matomo_table() {
+    let sql = "INSERT INTO matomo_user_language (login, use_12_hour_clock) VALUES ('root','0') ON DUPLICATE KEY UPDATE use_12_hour_clock='0'";
+    let result = translate_sql(sql, &TranslatorConfig::default()).unwrap();
+
+    assert!(result.translated_sql.contains(
+        "INSERT INTO \"matomo_user_language\" (\"login\", \"use_12_hour_clock\", \"language\") VALUES ('root', '0', '')"
+    ));
+    assert!(result
+        .translated_sql
+        .contains("ON CONFLICT (\"login\") DO UPDATE SET \"use_12_hour_clock\" = '0'"));
+}
+
+#[test]
 fn on_duplicate_key_update_normalizes_mysql_escaped_string_literals() {
     let sql = r#"INSERT INTO matomo_session (id, modified, lifetime, data) VALUES ('abc', '1780099497', '1209600', 'a:1:{s:4:\"data\";s:5:\"hello\";}') ON DUPLICATE KEY UPDATE modified = '1780099497', lifetime = '1209600', data = 'a:1:{s:4:\"data\";s:5:\"hello\";}'"#;
     let result = translate_sql(sql, &TranslatorConfig::default()).unwrap();
