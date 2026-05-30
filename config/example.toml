@@ -1,0 +1,15 @@
+[server]
+bind_addr = "0.0.0.0:8080"
+mysql_bind_addr = "0.0.0.0:3306"
+
+[postgres]
+driver = "tokio-postgres"
+connection_string = "host=127.0.0.1 port=5432 user=postgres password=postgres dbname=postgres"
+
+[translator]
+rewrite_limit_comma = true
+normalize_mysql_backticks = true
+normalize_boolean_literals = true
+rewrite_mysql_functions = true
+rewrite_json_operators = true
+strip_mysql_table_options = true

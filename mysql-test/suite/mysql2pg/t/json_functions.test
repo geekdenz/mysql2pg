@@ -1,0 +1,21 @@
+DROP TABLE IF EXISTS mtr_json_items;
+
+CREATE TABLE mtr_json_items (
+  id INT AUTO_INCREMENT PRIMARY KEY,
+  payload JSON,
+  note VARCHAR(32)
+);
+
+INSERT INTO mtr_json_items (payload, note) VALUES
+  ('{"color":"red","size":"M"}', 'shirt'),
+  ('{"color":"blue"}', NULL);
+
+SELECT
+  id,
+  JSON_EXTRACT(payload, '$.color') AS color,
+  IFNULL(note, 'missing') AS note
+FROM mtr_json_items
+ORDER BY id;
+
+DROP TABLE mtr_json_items;
+

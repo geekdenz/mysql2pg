@@ -1,0 +1,32 @@
+DROP VIEW IF EXISTS mtr_customer_totals;
+DROP TABLE IF EXISTS mtr_order_items;
+CREATE TABLE mtr_order_items (
+id INT AUTO_INCREMENT PRIMARY KEY,
+customer_name VARCHAR(32) NOT NULL,
+amount DECIMAL(10,2) NOT NULL
+);
+INSERT INTO mtr_order_items (customer_name, amount) VALUES
+('Ada', 10.00),
+('Ada', 15.25),
+('Linus', 7.50);
+CREATE VIEW mtr_customer_totals AS
+SELECT customer_name, SUM(amount) AS total_amount
+FROM mtr_order_items
+GROUP BY customer_name;
+SHOW FULL TABLES LIKE 'mtr\\_%';
+Tables_in_current_schema	Table_type
+mtr_customer_totals	VIEW
+mtr_order_items	BASE TABLE
+DESC mtr_order_items;
+Field	Type	Null	Key	Default	Extra
+id	integer	NO	PRI		auto_increment
+customer_name	character varying(32)	NO			
+amount	numeric(10,2)	NO			
+SHOW CREATE VIEW mtr_customer_totals;
+View	Create View
+mtr_customer_totals	CREATE VIEW mtr_customer_totals AS  SELECT customer_name,
+    sum(amount) AS total_amount
+   FROM mtr_order_items
+  GROUP BY customer_name;
+DROP VIEW mtr_customer_totals;
+DROP TABLE mtr_order_items;

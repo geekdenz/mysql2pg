@@ -1,0 +1,24 @@
+DROP TABLE IF EXISTS mtr_text_orders;
+CREATE TABLE mtr_text_orders (
+id INT AUTO_INCREMENT PRIMARY KEY,
+customer_name VARCHAR(32) NOT NULL,
+total DECIMAL(10,2),
+is_paid BOOLEAN NOT NULL
+);
+INSERT INTO mtr_text_orders (customer_name, total, is_paid) VALUES
+('Ada', 12.50, TRUE),
+('Linus', 20.00, FALSE),
+('Grace', NULL, TRUE);
+SELECT id, customer_name, total, is_paid
+FROM mtr_text_orders
+ORDER BY id;
+id	customer_name	total	is_paid
+1	Ada	12.50	t
+2	Linus	20.00	f
+3	Grace		t
+SELECT COUNT(*) AS paid_count
+FROM mtr_text_orders
+WHERE is_paid = TRUE;
+paid_count
+2
+DROP TABLE mtr_text_orders;

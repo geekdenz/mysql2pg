@@ -1,0 +1,18 @@
+ARG MATOMO_TESTS_IMAGE_TAG=5.8.0-apache
+FROM composer:2 AS composer_bin
+
+FROM matomo:${MATOMO_TESTS_IMAGE_TAG}
+
+COPY --from=composer_bin /usr/bin/composer /usr/local/bin/composer
+COPY matomo-tests/entrypoint.sh /usr/local/bin/mysql2pg-matomo-entrypoint.sh
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends git unzip mariadb-client \
+    && ln -s /var/www/html/tests /var/www/tests \
+    && chmod +x /usr/local/bin/mysql2pg-matomo-entrypoint.sh \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /var/www/html
+
+ENTRYPOINT ["/usr/local/bin/mysql2pg-matomo-entrypoint.sh"]
+CMD ["apache2-foreground"]
