@@ -1,0 +1,84 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing release tag to build
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+env:
+  RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+
+jobs:
+  linux:
+    name: Linux packages
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install packaging tools
+        run: cargo install cargo-deb cargo-generate-rpm --locked
+      - name: Build binary
+        run: cargo build --release --locked
+      - name: Build Debian package
+        run: mkdir -p target/packages && cargo deb --no-build --output target/packages
+      - name: Build RPM package
+        run: cargo generate-rpm --output target/packages
+      - name: Build Arch package
+        run: |
+          version="${RELEASE_TAG#v}"
+          mkdir -p target/arch/mysql2pg-middleware-${version}
+          cp target/release/mysql2pg-middleware config/example.toml COPYRIGHT.md packaging/arch/PKGBUILD target/arch/mysql2pg-middleware-${version}/
+          sed -i "s/^pkgver=.*/pkgver=${version}/" target/arch/mysql2pg-middleware-${version}/PKGBUILD
+          tar -C target/arch -czf target/arch/mysql2pg-middleware-${version}.tar.gz mysql2pg-middleware-${version}
+          cp target/arch/mysql2pg-middleware-${version}.tar.gz target/arch/mysql2pg-middleware-${version}/
+          docker run --rm -v "$PWD:/work" -w /work archlinux:base-devel bash -lc "pacman -Sy --noconfirm git && useradd -m builder && chown -R builder:builder /work/target/arch && su builder -c 'cd /work/target/arch/mysql2pg-middleware-${version} && makepkg --force --noconfirm'"
+          cp target/arch/mysql2pg-middleware-${version}/*.pkg.tar.zst target/packages/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-packages
+          path: target/packages/*
+
+  windows:
+    name: Windows MSI
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable-x86_64-pc-windows-msvc
+      - name: Build binary
+        run: cargo build --release --locked
+      - name: Build MSI
+        shell: pwsh
+        run: |
+          $version = "${env:RELEASE_TAG}" -replace '^v', ''
+          & "${env:WIX}bin\candle.exe" -dProductVersion=$version packaging\windows\mysql2pg-middleware.wxs -out target\mysql2pg-middleware.wixobj
+          & "${env:WIX}bin\light.exe" -ext WixUIExtension target\mysql2pg-middleware.wixobj -out target\mysql2pg-middleware-$version.msi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-installer
+          path: target/*.msi
+
+  publish:
+    name: Publish release
+    needs: [linux, windows]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+      - uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: dist/**/*

@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Wix xmlns="http://schemas.microsoft.com/wix/2006/wi">
+  <Product Id="*" Name="mysql2pg-middleware" Language="1033" Version="$(var.ProductVersion)" Manufacturer="Denz" UpgradeCode="2D2D5B1C-A5EF-4B21-9F46-DBE4BB6D5C20">
+    <Package InstallerVersion="500" Compressed="yes" InstallScope="perMachine" />
+    <MajorUpgrade DowngradeErrorMessage="A newer version of mysql2pg-middleware is already installed." />
+    <MediaTemplate EmbedCab="yes" />
+    <Feature Id="MainFeature" Title="mysql2pg-middleware" Level="1">
+      <ComponentGroupRef Id="ProductComponents" />
+    </Feature>
+  </Product>
+  <Fragment>
+    <Directory Id="TARGETDIR" Name="SourceDir">
+      <Directory Id="ProgramFilesFolder">
+        <Directory Id="INSTALLFOLDER" Name="mysql2pg-middleware" />
+      </Directory>
+    </Directory>
+  </Fragment>
+  <Fragment>
+    <ComponentGroup Id="ProductComponents" Directory="INSTALLFOLDER">
+      <Component Id="MainExecutable">
+        <File Id="MiddlewareExe" Source="target\release\mysql2pg-middleware.exe" KeyPath="yes" />
+      </Component>
+      <Component Id="ExampleConfig">
+        <File Id="ExampleToml" Source="config\example.toml" />
+      </Component>
+    </ComponentGroup>
+  </Fragment>
+</Wix>

@@ -5,6 +5,23 @@ edition = "2021"
 description = "A Rust middleware that parses MySQL SQL, translates it to PostgreSQL SQL, and can expose a MySQL-compatible server front end."
 license = "MIT"
 
+[package.metadata.deb]
+maintainer = "Denz <geekdenz@users.noreply.github.com>"
+copyright = "2026, Denz"
+extended-description = "MySQL-compatible SQL translation middleware backed by PostgreSQL."
+section = "database"
+priority = "optional"
+assets = [
+    ["target/release/mysql2pg-middleware", "usr/bin/mysql2pg-middleware", "755"],
+    ["config/example.toml", "etc/mysql2pg-middleware/example.toml", "644"],
+]
+
+[package.metadata.generate-rpm]
+assets = [
+    { source = "target/release/mysql2pg-middleware", dest = "/usr/bin/mysql2pg-middleware", mode = "755" },
+    { source = "config/example.toml", dest = "/etc/mysql2pg-middleware/example.toml", mode = "644", config = true },
+]
+
 [dependencies]
 anyhow = "1"
 async-trait = "0.1"

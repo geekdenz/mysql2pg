@@ -42,10 +42,11 @@ services:
       - postgres_data:/var/lib/postgresql/data
 
   matomo:
-    image: matomo:${MATOMO_IMAGE_TAG:-5.10.0-apache}
+    image: matomo:${MATOMO_IMAGE_TAG:-5.10.1-apache}
     profiles: ["matomo"]
     environment:
       PHP_MEMORY_LIMIT: ${MATOMO_PHP_MEMORY_LIMIT:-512M}
+      MATOMO_ARCHIVE_URL: ${MATOMO_ARCHIVE_URL:-http://matomo}
     ports:
       - "${MATOMO_PORT:-8081}:80"
     depends_on:
@@ -53,6 +54,19 @@ services:
         condition: service_started
     volumes:
       - matomo_data:/var/www/html
+
+  matomo-archive:
+    image: matomo:${MATOMO_IMAGE_TAG:-5.10.1-apache}
+    profiles: ["matomo-archive"]
+    environment:
+      PHP_MEMORY_LIMIT: ${MATOMO_PHP_MEMORY_LIMIT:-512M}
+      MATOMO_ARCHIVE_URL: ${MATOMO_ARCHIVE_URL:-http://matomo}
+    depends_on:
+      matomo:
+        condition: service_started
+    volumes:
+      - matomo_data:/var/www/html
+    command: ["sh", "-lc", "while true; do php /var/www/html/console core:archive --url=$${MATOMO_ARCHIVE_URL}; sleep 300; done"]
 
 volumes:
   postgres_data:

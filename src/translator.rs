@@ -106,6 +106,10 @@ pub fn translate_sql(sql: &str, cfg: &TranslatorConfig) -> Result<TranslationRes
 fn translate_unparsed_sql(
     sql: &str,
 ) -> Result<Option<(String, String, Vec<String>)>, MiddlewareError> {
+    if let Some((translated_sql, warnings)) = translate_load_data_direct(sql)? {
+        return Ok(Some((sql.trim().to_string(), translated_sql, warnings)));
+    }
+
     if let Some((translated_sql, warnings)) = translate_insert_on_duplicate_key_direct(sql)? {
         return Ok(Some((sql.trim().to_string(), translated_sql, warnings)));
     }
@@ -115,6 +119,125 @@ fn translate_unparsed_sql(
     }
 
     Ok(None)
+}
+
+fn translate_load_data_direct(
+    sql: &str,
+) -> Result<Option<(String, Vec<String>)>, MiddlewareError> {
+    let re = Regex::new(
+        r#"(?is)^\s*LOAD\s+DATA\s+(LOCAL\s+)?INFILE\s+(?:'([^']*)'|\"([^\"]*)\")\s+INTO\s+TABLE\s+([`\"A-Za-z0-9_.]+)(.*?);?\s*$"#,
+    )
+    .expect("valid LOAD DATA regex");
+    let Some(caps) = re.captures(sql) else {
+        return Ok(None);
+    };
+
+    if caps.get(1).is_some() {
+        return Err(MiddlewareError::Translation(
+            "LOAD DATA LOCAL INFILE requires MySQL client-local-infile wire support; server-side LOAD DATA INFILE is supported".to_string(),
+        ));
+    }
+
+    let path = caps
+        .get(2)
+        .or_else(|| caps.get(3))
+        .map(|m| m.as_str())
+        .unwrap_or_default();
+    let table = quote_object_name_from_text(caps.get(4).map(|m| m.as_str()).unwrap_or_default());
+    let options = caps.get(5).map(|m| m.as_str()).unwrap_or_default();
+    let mut delimiter = "\t".to_string();
+    let mut line_ending = "\\n".to_string();
+    let mut columns = None;
+
+    let field_re = Regex::new(r#"(?is)FIELDS\s+TERMINATED\s+BY\s+(?:'([^']*)'|\"([^\"]*)\")"#).expect("valid fields regex");
+    if let Some(field_caps) = field_re.captures(options) {
+        delimiter = field_caps
+            .get(1)
+            .or_else(|| field_caps.get(2))
+            .map(|m| m.as_str())
+            .map(decode_mysql_copy_escape)
+            .unwrap_or_else(|| "\t".to_string());
+    }
+    let line_re = Regex::new(r#"(?is)LINES\s+TERMINATED\s+BY\s+(?:'([^']*)'|\"([^\"]*)\")"#).expect("valid lines regex");
+    if let Some(line_caps) = line_re.captures(options) {
+        line_ending = line_caps
+            .get(1)
+            .or_else(|| line_caps.get(2))
+            .map(|m| m.as_str())
+            .unwrap_or("\\n")
+            .to_string();
+    }
+    let column_re = Regex::new(r"(?is)\(([^()]*)\)\s*$").expect("valid column list regex");
+    if let Some(column_caps) = column_re.captures(options) {
+        let rendered = column_caps
+            .get(1)
+            .map(|m| m.as_str())
+            .unwrap_or_default()
+            .split(',')
+            .map(|column| quote_ident(column.trim().trim_matches('`').trim_matches('"')))
+            .collect::<Vec<_>>();
+        if !rendered.is_empty() {
+            columns = Some(format!(" ({})", rendered.join(", ")));
+        }
+    }
+
+    let translated = format!(
+        "COPY {}{} FROM {} WITH (FORMAT csv, DELIMITER {}, NULL '\\\\N', HEADER false)",
+        table,
+        columns.unwrap_or_default(),
+        quote_string_literal(path),
+        quote_copy_literal(&delimiter),
+    );
+    let mut warnings = vec![
+        "rewrote server-side MySQL LOAD DATA INFILE to PostgreSQL COPY".to_string(),
+    ];
+    if line_ending != "\\n" {
+        warnings.push("LOAD DATA line terminators other than newline require PostgreSQL COPY preprocessing".to_string());
+    }
+    if options.to_ascii_uppercase().contains("IGNORE ") || options.to_ascii_uppercase().contains("REPLACE") {
+        warnings.push("LOAD DATA IGNORE/REPLACE semantics are not equivalent to PostgreSQL COPY".to_string());
+    }
+    Ok(Some((translated, warnings)))
+}
+
+fn quote_copy_literal(value: &str) -> String {
+    format!("E'{}'", value.replace('\\', "\\\\").replace('\'', "''"))
+}
+
+fn decode_mysql_copy_escape(value: &str) -> String {
+    let mut decoded = String::with_capacity(value.len());
+    let mut chars = value.chars();
+    while let Some(ch) = chars.next() {
+        if ch != '\\' {
+            decoded.push(ch);
+            continue;
+        }
+        match chars.next() {
+            Some('t') => decoded.push('\t'),
+            Some('n') => decoded.push('\n'),
+            Some('r') => decoded.push('\r'),
+            Some('0') => decoded.push('\0'),
+            Some('\\') => decoded.push('\\'),
+            Some(other) => {
+                decoded.push('\\');
+                decoded.push(other);
+            }
+            None => decoded.push('\\'),
+        }
+    }
+    decoded
+}
+
+fn quote_string_literal(value: &str) -> String {
+    format!("'{}'", value.replace('\\', "\\\\").replace('\'', "''"))
+}
+
+fn quote_object_name_from_text(value: &str) -> String {
+    value
+        .split('.')
+        .map(|part| quote_ident(part.trim().trim_matches('`').trim_matches('"')))
+        .collect::<Vec<_>>()
+        .join(".")
 }
 
 fn statement_requires_unsupported_rejection(stmt: &Statement) -> bool {

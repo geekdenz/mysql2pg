@@ -13,4 +13,9 @@ mkdir -p \
 chown -R www-data:www-data "${MATOMO_ROOT}/tmp"
 chmod -R u+rwX,g+rwX "${MATOMO_ROOT}/tmp"
 
+if [[ -n "${MATOMO_INTERNAL_PORT:-}" && "${MATOMO_INTERNAL_PORT}" != "80" ]]; then
+  sed -i -E "s/Listen 80/Listen ${MATOMO_INTERNAL_PORT}/; s/<VirtualHost \*:80>/<VirtualHost *:${MATOMO_INTERNAL_PORT}>/" \
+    /etc/apache2/ports.conf /etc/apache2/sites-available/000-default.conf
+fi
+
 exec /entrypoint.sh "$@"

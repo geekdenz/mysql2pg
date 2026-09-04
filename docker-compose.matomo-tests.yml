@@ -48,11 +48,12 @@ services:
     environment:
       APACHE_DOCUMENT_ROOT: /var/www/html
       COMPOSER_ALLOW_SUPERUSER: "1"
+      MATOMO_INTERNAL_PORT: 8084
     depends_on:
       matomo-tests-middleware:
         condition: service_started
     ports:
-      - "${MATOMO_TESTS_WEB_PORT:-8084}:80"
+      - "${MATOMO_TESTS_WEB_PORT:-8084}:8084"
     volumes:
       - ./tmp/matomo-5.8.0:/var/www/html
       - ./scripts:/opt/mysql2pg/scripts:ro

@@ -71,6 +71,16 @@ Implemented through PostgreSQL catalog queries or compatibility rowsets:
 
 See [docs/compatibility.md](/home/denz/projects/denz/mysql2pg-middleware/docs/compatibility.md) for details and current limits.
 
+## Releases
+
+Create a release from a clean checkout with:
+
+```bash
+scripts/release.sh
+```
+
+The script asks for the next `MAJOR.MINOR.PATCH` version, updates package metadata, runs `cargo check`, creates a release commit and annotated `vX.Y.Z` tag, then pushes the current branch and tag. The tag workflow publishes Linux `.deb`, `.rpm`, and Arch `.pkg.tar.zst` packages plus a Windows `.msi` installer to the GitHub release.
+
 ## Important current limitations
 
 - The MySQL frontend currently translates and executes text queries against PostgreSQL.
@@ -115,7 +125,7 @@ MYSQL_FRONTEND_PORT=3307
 
 ### Run Matomo against the middleware
 
-The compose file includes an optional `matomo` service using the official Matomo Docker image. It defaults to `matomo:5.10.0-apache`, the current stable Apache tag checked on May 25, 2026.
+The compose file includes an optional `matomo` service using the official Matomo Docker image. It defaults to `matomo:5.10.1-apache`.
 
 The service is behind the `matomo` Compose profile, so a plain `docker compose up -d` starts only the middleware and PostgreSQL. Start Matomo explicitly with:
 
