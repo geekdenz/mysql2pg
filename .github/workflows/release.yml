@@ -38,7 +38,9 @@ jobs:
         run: |
           version="${RELEASE_TAG#v}"
           mkdir -p target/arch/mysql2pg-middleware-${version}
-          cp target/release/mysql2pg-middleware config/example.toml COPYRIGHT.md packaging/arch/PKGBUILD target/arch/mysql2pg-middleware-${version}/
+          mkdir -p target/arch/mysql2pg-middleware-${version}/config
+          cp target/release/mysql2pg-middleware COPYRIGHT.md packaging/arch/PKGBUILD target/arch/mysql2pg-middleware-${version}/
+          cp config/example.toml target/arch/mysql2pg-middleware-${version}/config/example.toml
           sed -i "s/^pkgver=.*/pkgver=${version}/" target/arch/mysql2pg-middleware-${version}/PKGBUILD
           docker run --rm -v "$PWD:/work" -w /work archlinux:base-devel bash -lc "pacman -Sy --noconfirm git && useradd -m builder && chown -R builder:builder /work/target/arch && su builder -c 'cd /work/target/arch/mysql2pg-middleware-${version} && makepkg --force --noconfirm'"
           cp target/arch/mysql2pg-middleware-${version}/*.pkg.tar.zst target/packages/
