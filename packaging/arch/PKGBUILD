@@ -1,5 +1,5 @@
 pkgname=mysql2pg-middleware
-pkgver=0.0.2
+pkgver=0.0.3
 pkgrel=1
 pkgdesc='MySQL-compatible SQL translation middleware backed by PostgreSQL'
 arch=('x86_64' 'aarch64')
