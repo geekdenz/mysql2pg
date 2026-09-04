@@ -61,7 +61,13 @@ jobs:
         shell: pwsh
         run: |
           $version = "${env:RELEASE_TAG}" -replace '^v', ''
-          & "${env:WIX}bin\candle.exe" -dProductVersion=$version packaging\windows\mysql2pg-middleware.wxs -out target\mysql2pg-middleware.wixobj
+          if ($version -notmatch '^\d+\.\d+\.\d+(\.\d+)?$') {
+            throw "MSI releases require a numeric semantic version, got: $version"
+          }
+          & "${env:WIX}bin\candle.exe" "-dProductVersion=$version" packaging\windows\mysql2pg-middleware.wxs -out target\mysql2pg-middleware.wixobj
+          if ($LASTEXITCODE -ne 0 -or -not (Test-Path target\mysql2pg-middleware.wixobj)) {
+            throw "WiX Candle did not produce target\mysql2pg-middleware.wixobj"
+          }
           & "${env:WIX}bin\light.exe" -ext WixUIExtension target\mysql2pg-middleware.wixobj -out target\mysql2pg-middleware-$version.msi
       - uses: actions/upload-artifact@v4
         with:
