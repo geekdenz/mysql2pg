@@ -6,11 +6,10 @@ arch=('x86_64' 'aarch64')
 url='https://github.com/geekdenz/mysql2pg'
 license=('MIT')
 depends=('glibc')
-source=("mysql2pg-middleware-${pkgver}.tar.gz")
-sha256sums=('SKIP')
+source=()
 
 package() {
-  install -Dm755 "${srcdir}/mysql2pg-middleware-${pkgver}/mysql2pg-middleware" "${pkgdir}/usr/bin/mysql2pg-middleware"
-  install -Dm644 "${srcdir}/mysql2pg-middleware-${pkgver}/config/example.toml" "${pkgdir}/etc/mysql2pg-middleware/example.toml"
-  install -Dm644 "${srcdir}/mysql2pg-middleware-${pkgver}/COPYRIGHT.md" "${pkgdir}/usr/share/licenses/${pkgname}/COPYRIGHT.md"
+  install -Dm755 "${startdir}/mysql2pg-middleware" "${pkgdir}/usr/bin/mysql2pg-middleware"
+  install -Dm644 "${startdir}/config/example.toml" "${pkgdir}/etc/mysql2pg-middleware/example.toml"
+  install -Dm644 "${startdir}/COPYRIGHT.md" "${pkgdir}/usr/share/licenses/${pkgname}/COPYRIGHT.md"
 }

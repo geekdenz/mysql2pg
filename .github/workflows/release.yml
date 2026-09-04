@@ -40,8 +40,6 @@ jobs:
           mkdir -p target/arch/mysql2pg-middleware-${version}
           cp target/release/mysql2pg-middleware config/example.toml COPYRIGHT.md packaging/arch/PKGBUILD target/arch/mysql2pg-middleware-${version}/
           sed -i "s/^pkgver=.*/pkgver=${version}/" target/arch/mysql2pg-middleware-${version}/PKGBUILD
-          tar -C target/arch -czf target/arch/mysql2pg-middleware-${version}.tar.gz mysql2pg-middleware-${version}
-          cp target/arch/mysql2pg-middleware-${version}.tar.gz target/arch/mysql2pg-middleware-${version}/
           docker run --rm -v "$PWD:/work" -w /work archlinux:base-devel bash -lc "pacman -Sy --noconfirm git && useradd -m builder && chown -R builder:builder /work/target/arch && su builder -c 'cd /work/target/arch/mysql2pg-middleware-${version} && makepkg --force --noconfirm'"
           cp target/arch/mysql2pg-middleware-${version}/*.pkg.tar.zst target/packages/
       - uses: actions/upload-artifact@v4
