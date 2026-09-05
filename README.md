@@ -119,6 +119,10 @@ The Playwright suite verifies administrator UI access and sends a real browser t
 
 ## Docker Compose usage
 
+To deploy Matomo and the middleware to `tim@wmsvt.com:matomo-mysql2pg`, run
+`./deploy.sh`. See [remote deployment](docs/deployment.md) for SSH access,
+persistent settings, first installation and backup behavior.
+
 ```bash
 cp .env.example .env
 docker compose up --build -d

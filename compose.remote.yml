@@ -1,0 +1,98 @@
+name: matomo-mysql2pg
+
+x-logging: &logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+services:
+  postgres:
+    image: postgres:17-bookworm
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: matomo
+      POSTGRES_USER: matomo
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Remote database password is required}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks: [database]
+    healthcheck:
+      test: [CMD-SHELL, "pg_isready -U matomo -d matomo"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+    logging: *logging
+
+  middleware:
+    image: matomo-mysql2pg-middleware:${DEPLOY_RELEASE:?Release identifier is required}
+    build:
+      context: .
+      dockerfile: Dockerfile
+      labels:
+        org.opencontainers.image.revision: ${DEPLOY_REVISION:-unknown}
+    restart: unless-stopped
+    environment:
+      MW_SERVER_BIND_ADDR: 0.0.0.0:8080
+      MW_MYSQL_BIND_ADDR: 0.0.0.0:3306
+      MW_POSTGRES_CONNECTION_STRING: host=postgres port=5432 user=matomo password=${POSTGRES_PASSWORD} dbname=matomo
+      RUST_LOG: info
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks: [database]
+    logging: *logging
+
+  matomo:
+    image: matomo:${MATOMO_IMAGE_TAG:-5.10.1-apache}
+    restart: unless-stopped
+    environment:
+      PHP_MEMORY_LIMIT: 512M
+      MATOMO_DATABASE_HOST: middleware
+      MATOMO_DATABASE_ADAPTER: MYSQLI
+      MATOMO_DATABASE_TABLES_PREFIX: matomo_
+      MATOMO_DATABASE_USERNAME: matomo
+      MATOMO_DATABASE_PASSWORD: ${POSTGRES_PASSWORD}
+      MATOMO_DATABASE_DBNAME: matomo
+    ports:
+      - "127.0.0.1:${MATOMO_PORT:-18084}:80"
+    volumes:
+      - matomo_data:/var/www/html
+      - ./deployment:/opt/deployment:ro
+    depends_on:
+      middleware:
+        condition: service_started
+    networks: [database, frontend]
+    healthcheck:
+      test: [CMD, php, /opt/deployment/healthcheck.php]
+      interval: 10s
+      timeout: 10s
+      start_period: 30s
+      retries: 30
+    logging: *logging
+
+  archive:
+    image: matomo:${MATOMO_IMAGE_TAG:-5.10.1-apache}
+    restart: unless-stopped
+    user: www-data
+    entrypoint: ["/bin/sh", "/opt/deployment/archive.sh"]
+    environment:
+      PHP_MEMORY_LIMIT: 512M
+      MATOMO_ARCHIVE_URL: ${MATOMO_ARCHIVE_URL:-http://matomo}
+    volumes:
+      - matomo_data:/var/www/html
+      - ./deployment:/opt/deployment:ro
+    depends_on:
+      matomo:
+        condition: service_healthy
+    networks: [database, frontend]
+    logging: *logging
+
+networks:
+  database:
+    internal: true
+  frontend:
+
+volumes:
+  postgres_data:
+  matomo_data:
