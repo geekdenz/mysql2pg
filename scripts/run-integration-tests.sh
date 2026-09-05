@@ -18,7 +18,7 @@ run_sql() {
 }
 
 echo "Checking temporary-table lifetime on one MySQL connection..."
-temporary_result="$(run_sql "DROP TEMPORARY TABLE IF EXISTS mysql2pg_integration_temp; CREATE TEMPORARY TABLE mysql2pg_integration_temp (value INT); INSERT INTO mysql2pg_integration_temp VALUES (7), (9); SELECT SUM(value) FROM mysql2pg_integration_temp;")"
+temporary_result="$(run_sql "DROP TABLE IF EXISTS mysql2pg_integration_temp; CREATE TEMPORARY TABLE mysql2pg_integration_temp (value INT); INSERT INTO mysql2pg_integration_temp VALUES (7), (9); SELECT SUM(value) FROM mysql2pg_integration_temp;")"
 [[ "${temporary_result}" == "16" ]] || {
   echo "temporary-table check failed: ${temporary_result}" >&2
   exit 1
