@@ -1,0 +1,45 @@
+name: Tests
+
+on:
+  push:
+    branches: [develop]
+  pull_request:
+
+jobs:
+  rust:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo test --locked
+
+  mysql-integration:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install MariaDB client
+        run: sudo apt-get update && sudo apt-get install -y mariadb-client
+      - name: Start middleware and PostgreSQL
+        env:
+          MIDDLEWARE_PORT: 18080
+          MYSQL_FRONTEND_PORT: 13306
+          POSTGRES_PORT: 15432
+        run: docker compose up --build -d
+      - name: Wait for middleware
+        run: |
+          for attempt in $(seq 1 30); do
+            curl --fail http://127.0.0.1:18080/health && exit 0
+            sleep 2
+          done
+          docker compose logs
+          exit 1
+      - name: Run MySQL-wire integration tests
+        env:
+          MYSQL_TEST_PORT: 13306
+        run: scripts/run-integration-tests.sh
+      - name: Collect logs
+        if: always()
+        run: docker compose logs
+      - name: Stop services
+        if: always()
+        run: docker compose down -v

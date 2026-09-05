@@ -1,0 +1,41 @@
+name: Matomo E2E
+
+on:
+  workflow_dispatch:
+    inputs:
+      matomo_url:
+        description: Installed Matomo URL reachable by the runner
+        required: true
+        type: string
+      username:
+        description: Matomo administrator username
+        required: true
+        default: root
+        type: string
+
+jobs:
+  browser:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Install Playwright dependencies
+        working-directory: e2e
+        run: npm ci --no-audit --no-fund
+      - name: Install Chromium
+        working-directory: e2e
+        run: npx playwright install --with-deps chromium
+      - name: Run Matomo browser tests
+        env:
+          MATOMO_E2E_URL: ${{ inputs.matomo_url }}
+          MATOMO_E2E_USERNAME: ${{ inputs.username }}
+          MATOMO_E2E_PASSWORD: ${{ secrets.MATOMO_E2E_PASSWORD }}
+        working-directory: e2e
+        run: npm test
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: matomo-playwright-report
+          path: e2e/playwright-report

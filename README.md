@@ -81,6 +81,31 @@ scripts/release.sh
 
 The script asks for the next `MAJOR.MINOR.PATCH` version, updates package metadata, runs `cargo check`, creates a release commit and annotated `vX.Y.Z` tag, then pushes the current branch and tag. The tag workflow publishes Linux `.deb`, `.rpm`, and Arch `.pkg.tar.zst` packages plus a Windows `.msi` installer to the GitHub release.
 
+## Test layers
+
+Run the fast unit and translation tests with:
+
+```bash
+cargo test --locked
+```
+
+Run live MySQL-wire tests against a running middleware/PostgreSQL Compose stack with:
+
+```bash
+scripts/run-integration-tests.sh
+```
+
+Run the Matomo browser suite against an already installed Matomo instance with:
+
+```bash
+MATOMO_E2E_URL=http://127.0.0.1:8081 \
+MATOMO_E2E_USERNAME=root \
+MATOMO_E2E_PASSWORD='ChangeMe123!' \
+scripts/run-matomo-e2e.sh
+```
+
+The Playwright suite verifies administrator UI access and sends a real browser tracking request to `matomo.php`. GitHub Actions exposes the same suite as a manual workflow because installation state and URL are environment-specific; configure the administrator password as the `MATOMO_E2E_PASSWORD` repository secret.
+
 ## Important current limitations
 
 - The MySQL frontend currently translates and executes text queries against PostgreSQL.

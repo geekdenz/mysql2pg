@@ -1,0 +1,10 @@
+{
+  "name": "mysql2pg-matomo-e2e",
+  "private": true,
+  "scripts": {
+    "test": "playwright test"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.55.0"
+  }
+}
