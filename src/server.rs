@@ -11,7 +11,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     config::AppConfig,
-    executor::{build_executor, connection_string_for_config, PostgresExecutor, QueryResult},
+    executor::{
+        build_executor, connection_string_for_config, install_mysql_compat_functions,
+        PostgresExecutor, QueryResult,
+    },
     mysql_server::{serve_mysql, MySqlFrontendFactory},
     translator::{translate_sql, TranslationResult},
 };
@@ -51,6 +54,8 @@ pub async fn serve(config: AppConfig) -> anyhow::Result<()> {
     let shared_config = Arc::new(config);
     let executor = build_executor(shared_config.as_ref())?;
     let connection_string = connection_string_for_config(shared_config.as_ref())?;
+
+    install_mysql_compat_functions(executor.as_ref()).await;
 
     let http_state = AppState {
         executor: executor.clone(),

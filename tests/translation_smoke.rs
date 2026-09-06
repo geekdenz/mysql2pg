@@ -31,16 +31,34 @@ fn on_duplicate_key_update_translation_smoke() {
 }
 
 #[test]
-fn on_duplicate_key_update_adds_user_language_default_for_prefixed_matomo_table() {
-    let sql = "INSERT INTO matomo_user_language (login, use_12_hour_clock) VALUES ('root','0') ON DUPLICATE KEY UPDATE use_12_hour_clock='0'";
+fn insert_ignore_combined_with_on_duplicate_key_update_is_supported() {
+    // Matomo writes archive rows with both clauses. In MySQL the ON DUPLICATE clause
+    // handles the duplicate key and IGNORE only downgrades other errors, so the
+    // upsert alone expresses the intent.
+    let sql = "INSERT IGNORE INTO `matomo_archive_numeric_2026_09` (idarchive, idsite, name, value) \
+               VALUES ('375','1','done.Goals','2') ON DUPLICATE KEY UPDATE value = '2'";
+    let result = translate_sql(sql, &TranslatorConfig::default()).unwrap();
+    assert!(result.translated_sql.contains("INSERT INTO \"matomo_archive_numeric_2026_09\""));
+    assert!(result.translated_sql.contains("DO UPDATE SET \"value\" = '2'"));
+    assert!(!result.translated_sql.to_uppercase().contains("IGNORE"));
+}
+
+#[test]
+fn insert_translation_does_not_invent_columns() {
+    // The translator must not add columns the statement did not name — it cannot see
+    // the schema, and guessing corrupts the statement for any application whose table
+    // happens to match a hardcoded name. A NOT NULL column the INSERT omits is
+    // supplied from the catalog at execution time instead (MySQL's implicit default).
+    let sql = "INSERT INTO app_user_language (login, use_12_hour_clock) VALUES ('root','0') ON DUPLICATE KEY UPDATE use_12_hour_clock='0'";
     let result = translate_sql(sql, &TranslatorConfig::default()).unwrap();
 
     assert!(result.translated_sql.contains(
-        "INSERT INTO \"matomo_user_language\" (\"login\", \"use_12_hour_clock\", \"language\") VALUES ('root', '0', '')"
+        "INSERT INTO \"app_user_language\" (\"login\", \"use_12_hour_clock\") VALUES ('root', '0')"
     ));
+    assert!(!result.translated_sql.contains("language\") VALUES"));
     assert!(result
         .translated_sql
-        .contains("ON CONFLICT (\"login\") DO UPDATE SET \"use_12_hour_clock\" = '0'"));
+        .contains("DO UPDATE SET \"use_12_hour_clock\" = '0'"));
 }
 
 #[test]
@@ -114,6 +132,20 @@ fn create_table_type_mappings_translation_smoke() {
     assert!(result.translated_sql.contains("\"happened_at\" TIMESTAMP(6)"));
     assert!(!result.translated_sql.contains("ON UPDATE CURRENT_TIMESTAMP"));
     assert!(!result.translated_sql.contains("ENGINE"));
+}
+
+#[test]
+fn mysql_hex_binary_literal_uses_postgres_decode() {
+    let result = translate_sql(
+        "SELECT idvisit FROM matomo_log_visit WHERE config_id = X'2df086e629bb0ff4'",
+        &TranslatorConfig::default(),
+    )
+    .unwrap();
+
+    assert!(result
+        .translated_sql
+        .contains("config_id = decode('2df086e629bb0ff4', 'hex')"));
+    assert!(!result.translated_sql.contains("X'2df086e629bb0ff4'"));
 }
 
 #[test]

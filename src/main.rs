@@ -85,7 +85,16 @@ async fn main() -> Result<()> {
                 } else {
                     println!("columns: {}", query_result.columns.join(", "));
                     for row in &query_result.rows {
-                        println!("{}", row.join(" | "));
+                        let rendered = row
+                            .iter()
+                            .map(|value| {
+                                value
+                                    .as_ref()
+                                    .map(|value| value.to_lossy_string())
+                                    .unwrap_or_else(|| "NULL".to_string())
+                            })
+                            .collect::<Vec<_>>();
+                        println!("{}", rendered.join(" | "));
                     }
                     println!("rows: {}", query_result.row_count);
                 }

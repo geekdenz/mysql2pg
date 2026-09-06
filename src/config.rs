@@ -27,7 +27,7 @@ pub struct PostgresConfig {
     pub connection_string: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct TranslatorConfig {
     #[serde(default = "default_rewrite_limit_comma")]
     pub rewrite_limit_comma: bool,

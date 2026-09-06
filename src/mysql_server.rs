@@ -89,6 +89,30 @@ static DEFAULT_DATABASE_NAME: LazyLock<Mutex<Option<String>>> =
     LazyLock::new(|| Mutex::new(None));
 const MYSQL_COMPAT_VERSION: &str = "11.8.7-MariaDB-ubu2404";
 const MYSQL_COMPAT_VERSION_COMMENT: &str = "MariaDB Server";
+static PG_SQLSTATE_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\[([0-9A-Z]{5})\]").unwrap());
+
+/// Maps a PostgreSQL SQLSTATE (bracketed by `format_pg_error` in executor.rs, e.g.
+/// `[23505] duplicate key value ...`) to the matching MySQL error code. Without
+/// this, every execution error was reported to the client as the generic
+/// ER_UNKNOWN_ERROR (1105), which breaks MySQL client code that branches on
+/// specific error codes — for example Matomo's `Sequence` helper, which expects a
+/// duplicate-key error (MySQL 1062) to retry as an UPDATE instead of surfacing a
+/// fatal error.
+fn mysql_error_kind_for_message(msg: &str) -> ErrorKind {
+    let Some(caps) = PG_SQLSTATE_RE.captures(msg) else {
+        return ErrorKind::ER_UNKNOWN_ERROR;
+    };
+    match &caps[1] {
+        "23505" => ErrorKind::ER_DUP_ENTRY,
+        "23503" => ErrorKind::ER_NO_REFERENCED_ROW_2,
+        "23502" => ErrorKind::ER_BAD_NULL_ERROR,
+        "42601" => ErrorKind::ER_PARSE_ERROR,
+        "22001" => ErrorKind::ER_DATA_TOO_LONG,
+        "40001" | "40P01" => ErrorKind::ER_LOCK_DEADLOCK,
+        "57014" => ErrorKind::ER_QUERY_INTERRUPTED,
+        _ => ErrorKind::ER_UNKNOWN_ERROR,
+    }
+}
 static SELECT_SYSTEM_VARIABLE_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
         r#"(?ix)
@@ -107,6 +131,15 @@ pub async fn serve_mysql(factory: MySqlFrontendFactory, bind_addr: String) -> an
 
     loop {
         let (socket, peer_addr) = listener.accept().await?;
+        // MySQL clients (and MySQL server itself) issue many small, sequential
+        // request/response packets per query. Without TCP_NODELAY, Nagle's
+        // algorithm on this socket interacting with the client's delayed ACKs adds
+        // ~40ms per round trip, which compounds badly for tracking requests that
+        // run dozens of sequential queries (multi-second requests instead of
+        // sub-second ones).
+        if let Err(err) = socket.set_nodelay(true) {
+            tracing::warn!("failed to set TCP_NODELAY for {}: {}", peer_addr, err);
+        }
         let backend = factory.connection_backend();
         tokio::spawn(async move {
             let (reader, writer) = split(socket);
@@ -196,6 +229,7 @@ where
             &self.session_collation,
             &self.session_sql_mode,
             &self.transaction_isolation,
+            self.last_insert_id,
             query,
         ) {
             let statement_id = self.next_statement_id;
@@ -341,7 +375,7 @@ where
                 Ok(None) => {}
                 Err(err) => {
                     let msg = err.to_string();
-                    results.error(ErrorKind::ER_UNKNOWN_ERROR, msg.as_bytes()).await?;
+                    results.error(mysql_error_kind_for_message(&msg), msg.as_bytes()).await?;
                     return Ok(());
                 }
             }
@@ -406,17 +440,8 @@ where
                     postgres_sql,
                     err
                 );
-                if let Some(query_result) =
-                    compat_empty_result_for_missing_matomo_option(
-                        &original_sql,
-                        &postgres_sql,
-                        &err,
-                    )
-                {
-                    return write_query_result(results, query_result).await;
-                }
                 let msg = err.to_string();
-                results.error(ErrorKind::ER_UNKNOWN_ERROR, msg.as_bytes()).await?;
+                results.error(mysql_error_kind_for_message(&msg), msg.as_bytes()).await?;
                 Ok(())
             }
         }
@@ -460,6 +485,7 @@ where
             &self.session_collation,
             &self.session_sql_mode,
             &self.transaction_isolation,
+            self.last_insert_id,
             trimmed,
         ) {
             write_canned_result(results, &columns, &rows).await?;
@@ -474,7 +500,7 @@ where
             Ok(None) => {}
             Err(err) => {
                 let msg = err.to_string();
-                results.error(ErrorKind::ER_UNKNOWN_ERROR, msg.as_bytes()).await?;
+                results.error(mysql_error_kind_for_message(&msg), msg.as_bytes()).await?;
                 return Ok(());
             }
         }
@@ -530,7 +556,24 @@ where
             Err(err) => {
                 tracing::warn!("mysql query execution failed for `{}`: {}", translated, err);
                 let msg = err.to_string();
-                results.error(ErrorKind::ER_UNKNOWN_ERROR, msg.as_bytes()).await?;
+                results.error(mysql_error_kind_for_message(&msg), msg.as_bytes()).await?;
+                Ok(())
+            }
+        }
+    }
+
+    async fn on_query_bytes<'a>(
+        &'a mut self,
+        query: &'a [u8],
+        results: QueryResultWriter<'a, W>,
+    ) -> Result<(), Self::Error> {
+        match normalize_mysql_query_bytes(query) {
+            Ok(query) => self.on_query(&query, results).await,
+            Err(err) => {
+                tracing::warn!("mysql query byte decoding failed: {}", err);
+                results
+                    .error(ErrorKind::ER_PARSE_ERROR, err.to_string().as_bytes())
+                    .await?;
                 Ok(())
             }
         }
@@ -583,7 +626,13 @@ where
 
     let mut writer = results.start(&columns).await?;
     for row in &query_result.rows {
-        writer.write_row(row.clone()).await?;
+        // Values go out as bytes: a BLOB column may hold arbitrary binary that is not
+        // valid UTF-8, and the MySQL text protocol transmits it verbatim.
+        let row = row
+            .iter()
+            .map(|value| value.as_ref().map(|value| value.as_bytes().to_vec()))
+            .collect::<Vec<_>>();
+        writer.write_row(row).await?;
     }
     writer.finish().await?;
     Ok(())
@@ -604,48 +653,6 @@ where
     }
     writer.finish().await?;
     Ok(())
-}
-
-fn compat_empty_result_for_missing_matomo_option(
-    original_sql: &str,
-    rendered_sql: &str,
-    err: &MiddlewareError,
-) -> Option<QueryResult> {
-    let err_text = err.to_string();
-    let missing_option_table =
-        err_text.contains("relation \"matomo_option\" does not exist")
-            || err_text.contains("relation \"option\" does not exist");
-    if !missing_option_table {
-        return None;
-    }
-
-    let normalized = rendered_sql.trim_start().to_ascii_uppercase();
-    let targets_option_table =
-        rendered_sql.contains("\"matomo_option\"") || rendered_sql.contains("\"option\"");
-    if !targets_option_table {
-        return None;
-    }
-
-    if normalized.starts_with("SELECT") {
-        let columns = infer_result_columns(original_sql);
-        return Some(QueryResult {
-            columns,
-            rows: Vec::new(),
-            row_count: 0,
-            last_insert_id: 0,
-        });
-    }
-
-    if normalized.starts_with("DELETE") || normalized.starts_with("UPDATE") {
-        return Some(QueryResult {
-            columns: Vec::new(),
-            rows: Vec::new(),
-            row_count: 0,
-            last_insert_id: 0,
-        });
-    }
-
-    None
 }
 
 fn make_string_column(name: &str) -> Column {
@@ -802,12 +809,29 @@ fn canned_response_for_query(query: &str) -> Option<(Vec<String>, Vec<Vec<String
     None
 }
 
+/// Matches `SELECT LAST_INSERT_ID()` with an optional alias, returning the column
+/// name the client should see.
+fn select_last_insert_id_alias(query: &str) -> Option<String> {
+    static LAST_INSERT_ID_RE: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"(?ix)^\s*SELECT\s+LAST_INSERT_ID\s*\(\s*\)\s*(?:AS\s+)?(?:`([^`]+)`|\b([A-Za-z_][A-Za-z0-9_]*)\b)?\s*;?\s*$")
+            .expect("valid LAST_INSERT_ID select regex")
+    });
+    let caps = LAST_INSERT_ID_RE.captures(query)?;
+    let alias = caps
+        .get(1)
+        .or_else(|| caps.get(2))
+        .map(|m| m.as_str().to_string())
+        .unwrap_or_else(|| "LAST_INSERT_ID()".to_string());
+    Some(alias)
+}
+
 fn dynamic_canned_response_for_query(
     connection_id: u32,
     current_db: Option<&str>,
     session_collation: &str,
     session_sql_mode: &str,
     transaction_isolation: &str,
+    last_insert_id: u64,
     query: &str,
 ) -> Option<(Vec<String>, Vec<Vec<String>>)> {
     let normalized = query.trim();
@@ -820,6 +844,12 @@ fn dynamic_canned_response_for_query(
         return Some(response);
     }
 
+    // `SELECT LAST_INSERT_ID()` is how many MySQL clients read back a generated key
+    // (PDO's lastInsertId() instead reads the value from the OK packet). The value is
+    // per-connection session state, so it is answered here rather than in PostgreSQL.
+    if let Some(alias) = select_last_insert_id_alias(normalized) {
+        return Some((vec![alias], vec![vec![last_insert_id.to_string()]]));
+    }
     if normalized.eq_ignore_ascii_case("SELECT CONNECTION_ID()") {
         return Some((
             vec!["CONNECTION_ID()".to_string()],
@@ -1165,6 +1195,106 @@ fn decode_mysql_params(params: ParamParser<'_>) -> Result<Vec<PgParam>, Middlewa
     params.into_iter().map(decode_mysql_param).collect()
 }
 
+fn normalize_mysql_query_bytes(query: &[u8]) -> Result<String, MiddlewareError> {
+    if !query.contains(&0) {
+        if let Ok(query) = std::str::from_utf8(query) {
+            return Ok(query.to_string());
+        }
+    }
+
+    let mut output = Vec::with_capacity(query.len());
+    let mut cursor = 0;
+    while cursor < query.len() {
+        if query[cursor] != b'\'' {
+            output.push(query[cursor]);
+            cursor += 1;
+            continue;
+        }
+
+        let literal_start = cursor;
+        cursor += 1;
+        let content_start = cursor;
+        let mut escaped = false;
+        while cursor < query.len() {
+            let byte = query[cursor];
+            if escaped {
+                escaped = false;
+                cursor += 1;
+                continue;
+            }
+            if byte == b'\\' {
+                escaped = true;
+                cursor += 1;
+                continue;
+            }
+            if byte == b'\'' {
+                if query.get(cursor + 1) == Some(&b'\'') {
+                    cursor += 2;
+                    continue;
+                }
+                break;
+            }
+            cursor += 1;
+        }
+
+        if cursor == query.len() {
+            return Err(MiddlewareError::Parse(
+                "unterminated string literal in MySQL query payload".to_string(),
+            ));
+        }
+
+        let content = &query[content_start..cursor];
+        if std::str::from_utf8(content).is_ok() && !content.contains(&0) {
+            output.extend_from_slice(&query[literal_start..=cursor]);
+        } else {
+            let decoded = decode_mysql_escaped_bytes(content);
+            output.extend_from_slice(b"X'");
+            for byte in decoded {
+                output.extend_from_slice(format!("{byte:02x}").as_bytes());
+            }
+            output.push(b'\'');
+        }
+        cursor += 1;
+    }
+
+    String::from_utf8(output).map_err(|err| {
+        MiddlewareError::Parse(format!(
+            "non-UTF-8 bytes outside a MySQL string literal at byte {}",
+            err.utf8_error().valid_up_to()
+        ))
+    })
+}
+
+fn decode_mysql_escaped_bytes(content: &[u8]) -> Vec<u8> {
+    let mut decoded = Vec::with_capacity(content.len());
+    let mut cursor = 0;
+    while cursor < content.len() {
+        if content[cursor] == b'\'' && content.get(cursor + 1) == Some(&b'\'') {
+            decoded.push(b'\'');
+            cursor += 2;
+            continue;
+        }
+        if content[cursor] != b'\\' || cursor + 1 == content.len() {
+            decoded.push(content[cursor]);
+            cursor += 1;
+            continue;
+        }
+
+        cursor += 1;
+        decoded.push(match content[cursor] {
+            b'0' => 0,
+            b'b' => 8,
+            b'n' => b'\n',
+            b'r' => b'\r',
+            b't' => b'\t',
+            b'Z' => 0x1a,
+            byte => byte,
+        });
+        cursor += 1;
+    }
+    decoded
+}
+
 fn translate_preparable_sql(
     query: &str,
     cfg: &crate::config::TranslatorConfig,
@@ -1361,10 +1491,149 @@ fn scan_prepare_placeholders(
     out
 }
 
+fn decode_mysql_param(param: opensrv_mysql::ParamValue<'_>) -> Result<PgParam, MiddlewareError> {
+    match param.value.into_inner() {
+        ValueInner::NULL => Ok(PgParam::Null),
+        ValueInner::Bytes(bytes) => Ok(PgParam::Bytes(bytes.to_vec())),
+        ValueInner::Int(v) => Ok(PgParam::Text(v.to_string())),
+        ValueInner::UInt(v) => Ok(PgParam::Text(v.to_string())),
+        ValueInner::Double(v) => Ok(PgParam::Text(v.to_string())),
+        ValueInner::Date(bytes) => Ok(PgParam::Text(decode_mysql_date_literal(bytes)?)),
+        ValueInner::Datetime(bytes) => Ok(PgParam::Text(decode_mysql_datetime_literal(bytes)?)),
+        ValueInner::Time(bytes) => Ok(PgParam::Text(decode_mysql_time_literal(bytes)?)),
+    }
+}
+
+fn decode_mysql_date_literal(bytes: &[u8]) -> Result<String, MiddlewareError> {
+    if bytes.len() != 4 {
+        return Err(MiddlewareError::Execution(format!(
+            "unsupported MySQL date parameter payload length {}",
+            bytes.len()
+        )));
+    }
+    let year = u16::from_le_bytes([bytes[0], bytes[1]]);
+    let month = bytes[2];
+    let day = bytes[3];
+    Ok(format!("{year:04}-{month:02}-{day:02}"))
+}
+
+fn decode_mysql_datetime_literal(bytes: &[u8]) -> Result<String, MiddlewareError> {
+    match bytes.len() {
+        0 => Ok("0000-00-00 00:00:00".to_string()),
+        4 => {
+            let year = u16::from_le_bytes([bytes[0], bytes[1]]);
+            let month = bytes[2];
+            let day = bytes[3];
+            Ok(format!("{year:04}-{month:02}-{day:02} 00:00:00"))
+        }
+        7 => {
+            let year = u16::from_le_bytes([bytes[0], bytes[1]]);
+            let month = bytes[2];
+            let day = bytes[3];
+            let hour = bytes[4];
+            let minute = bytes[5];
+            let second = bytes[6];
+            Ok(format!("{year:04}-{month:02}-{day:02} {hour:02}:{minute:02}:{second:02}"))
+        }
+        11 => {
+            let year = u16::from_le_bytes([bytes[0], bytes[1]]);
+            let month = bytes[2];
+            let day = bytes[3];
+            let hour = bytes[4];
+            let minute = bytes[5];
+            let second = bytes[6];
+            let micros = u32::from_le_bytes([bytes[7], bytes[8], bytes[9], bytes[10]]);
+            Ok(format!(
+                "{year:04}-{month:02}-{day:02} {hour:02}:{minute:02}:{second:02}.{micros:06}"
+            ))
+        }
+        len => Err(MiddlewareError::Execution(format!(
+            "unsupported MySQL datetime parameter payload length {len}"
+        ))),
+    }
+}
+
+fn decode_mysql_time_literal(bytes: &[u8]) -> Result<String, MiddlewareError> {
+    if bytes.len() != 8 && bytes.len() != 12 {
+        return Err(MiddlewareError::Execution(format!(
+            "unsupported MySQL time parameter payload length {}",
+            bytes.len()
+        )));
+    }
+    let is_negative = bytes[0];
+    let days = u32::from_le_bytes([bytes[1], bytes[2], bytes[3], bytes[4]]);
+    let hours = bytes[5];
+    let minutes = bytes[6];
+    let seconds = bytes[7];
+    let micros = if bytes.len() == 12 {
+        u32::from_le_bytes([bytes[8], bytes[9], bytes[10], bytes[11]])
+    } else {
+        0
+    };
+
+    let total_hours = days * 24 + u32::from(hours);
+    let sign = if is_negative != 0 { "-" } else { "" };
+    let fraction = if micros > 0 {
+        format!(".{micros:06}")
+    } else {
+        String::new()
+    };
+    Ok(format!("{sign}{total_hours:02}:{minutes:02}:{seconds:02}{fraction}"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::config::TranslatorConfig;
+
+    #[test]
+    fn answers_select_last_insert_id_from_session_state() {
+        // Many MySQL clients read a generated key with `SELECT LAST_INSERT_ID()`
+        // rather than the OK packet, and PostgreSQL has no such function.
+        let (columns, rows) = dynamic_canned_response_for_query(
+            9,
+            Some("app"),
+            "utf8mb4_general_ci",
+            "",
+            "REPEATABLE-READ",
+            4711,
+            "SELECT LAST_INSERT_ID()",
+        )
+        .expect("LAST_INSERT_ID() should be answered from session state");
+        assert_eq!(columns, vec!["LAST_INSERT_ID()".to_string()]);
+        assert_eq!(rows, vec![vec!["4711".to_string()]]);
+    }
+
+    #[test]
+    fn select_last_insert_id_keeps_its_alias() {
+        let (columns, _) = dynamic_canned_response_for_query(
+            9,
+            Some("app"),
+            "utf8mb4_general_ci",
+            "",
+            "REPEATABLE-READ",
+            7,
+            "SELECT LAST_INSERT_ID() AS `id`",
+        )
+        .expect("aliased LAST_INSERT_ID() should be answered");
+        assert_eq!(columns, vec!["id".to_string()]);
+    }
+
+    #[test]
+    fn maps_postgres_unique_violation_to_mysql_duplicate_entry() {
+        let msg = "execution error: statement failed: [23505] duplicate key value violates \
+                    unique constraint \"matomo_sequence_pkey\"";
+        assert!(matches!(mysql_error_kind_for_message(msg), ErrorKind::ER_DUP_ENTRY));
+    }
+
+    #[test]
+    fn falls_back_to_unknown_error_without_a_recognized_sqlstate() {
+        let msg = "execution error: statement failed: connection reset";
+        assert!(matches!(
+            mysql_error_kind_for_message(msg),
+            ErrorKind::ER_UNKNOWN_ERROR
+        ));
+    }
 
     #[test]
     fn translate_preparable_show_variables_like_param() {
@@ -1463,6 +1732,36 @@ mod tests {
     }
 
     #[test]
+    fn normalizes_matomo_binary_config_id_literal() {
+        let mut query = b"SELECT idvisit FROM matomo_log_visit WHERE config_id = '".to_vec();
+        query.extend_from_slice(&[0x2d, 0xf0, 0x86, 0xe6, 0x29, 0xbb, 0x0f, 0xf4]);
+        query.extend_from_slice(b"' LIMIT 1");
+
+        assert_eq!(
+            normalize_mysql_query_bytes(&query).unwrap(),
+            "SELECT idvisit FROM matomo_log_visit WHERE config_id = X'2df086e629bb0ff4' LIMIT 1"
+        );
+    }
+
+    #[test]
+    fn normalizes_nul_and_mysql_escapes_in_binary_literal() {
+        let query = b"SELECT 1 WHERE payload = 'a\\0b\\\\c\\'d\0'";
+
+        assert_eq!(
+            normalize_mysql_query_bytes(query).unwrap(),
+            "SELECT 1 WHERE payload = X'6100625c63276400'"
+        );
+    }
+
+    #[test]
+    fn rejects_non_utf8_bytes_outside_literals() {
+        let error = normalize_mysql_query_bytes(b"SELECT \xff").unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("non-UTF-8 bytes outside a MySQL string literal"));
+    }
+
+    #[test]
     fn mysql_session_compat_noops_cover_wait_timeout() {
         assert!(is_compat_noop_query("SET wait_timeout=28800"));
         assert!(is_compat_noop_query("SET SESSION group_concat_max_len=131072"));
@@ -1484,6 +1783,7 @@ mod tests {
             "utf8mb4_general_ci",
             "NO_AUTO_VALUE_ON_ZERO",
             "REPEATABLE-READ",
+            0,
             "SELECT @@sql_mode AS sql_mode",
         )
         .unwrap();
@@ -1496,6 +1796,7 @@ mod tests {
             "utf8mb4_general_ci",
             "ANSI_QUOTES",
             "REPEATABLE-READ",
+            0,
             "SELECT @@SESSION.sql_mode",
         )
         .unwrap();
@@ -1511,6 +1812,7 @@ mod tests {
             "utf8mb4_general_ci",
             "NO_AUTO_VALUE_ON_ZERO",
             "REPEATABLE-READ",
+            0,
             "SELECT @@VERSION",
         )
         .unwrap();
@@ -1546,96 +1848,4 @@ mod tests {
         assert!(collation_matches_charset("utf8", "utf8_general_ci"));
         assert!(collation_matches_charset("utf8mb4", "utf8mb4_general_ci"));
     }
-}
-
-fn decode_mysql_param(param: opensrv_mysql::ParamValue<'_>) -> Result<PgParam, MiddlewareError> {
-    match param.value.into_inner() {
-        ValueInner::NULL => Ok(PgParam::Null),
-        ValueInner::Bytes(bytes) => Ok(PgParam::Text(std::str::from_utf8(bytes).map_err(|_| {
-            MiddlewareError::Execution("binary prepared statement parameters are not supported yet".to_string())
-        })?.to_string())),
-        ValueInner::Int(v) => Ok(PgParam::Text(v.to_string())),
-        ValueInner::UInt(v) => Ok(PgParam::Text(v.to_string())),
-        ValueInner::Double(v) => Ok(PgParam::Text(v.to_string())),
-        ValueInner::Date(bytes) => Ok(PgParam::Text(decode_mysql_date_literal(bytes)?)),
-        ValueInner::Datetime(bytes) => Ok(PgParam::Text(decode_mysql_datetime_literal(bytes)?)),
-        ValueInner::Time(bytes) => Ok(PgParam::Text(decode_mysql_time_literal(bytes)?)),
-    }
-}
-
-fn decode_mysql_date_literal(bytes: &[u8]) -> Result<String, MiddlewareError> {
-    if bytes.len() != 4 {
-        return Err(MiddlewareError::Execution(format!(
-            "unsupported MySQL date parameter payload length {}",
-            bytes.len()
-        )));
-    }
-    let year = u16::from_le_bytes([bytes[0], bytes[1]]);
-    let month = bytes[2];
-    let day = bytes[3];
-    Ok(format!("{year:04}-{month:02}-{day:02}"))
-}
-
-fn decode_mysql_datetime_literal(bytes: &[u8]) -> Result<String, MiddlewareError> {
-    match bytes.len() {
-        0 => Ok("0000-00-00 00:00:00".to_string()),
-        4 => {
-            let year = u16::from_le_bytes([bytes[0], bytes[1]]);
-            let month = bytes[2];
-            let day = bytes[3];
-            Ok(format!("{year:04}-{month:02}-{day:02} 00:00:00"))
-        }
-        7 => {
-            let year = u16::from_le_bytes([bytes[0], bytes[1]]);
-            let month = bytes[2];
-            let day = bytes[3];
-            let hour = bytes[4];
-            let minute = bytes[5];
-            let second = bytes[6];
-            Ok(format!("{year:04}-{month:02}-{day:02} {hour:02}:{minute:02}:{second:02}"))
-        }
-        11 => {
-            let year = u16::from_le_bytes([bytes[0], bytes[1]]);
-            let month = bytes[2];
-            let day = bytes[3];
-            let hour = bytes[4];
-            let minute = bytes[5];
-            let second = bytes[6];
-            let micros = u32::from_le_bytes([bytes[7], bytes[8], bytes[9], bytes[10]]);
-            Ok(format!(
-                "{year:04}-{month:02}-{day:02} {hour:02}:{minute:02}:{second:02}.{micros:06}"
-            ))
-        }
-        len => Err(MiddlewareError::Execution(format!(
-            "unsupported MySQL datetime parameter payload length {len}"
-        ))),
-    }
-}
-
-fn decode_mysql_time_literal(bytes: &[u8]) -> Result<String, MiddlewareError> {
-    if bytes.len() != 8 && bytes.len() != 12 {
-        return Err(MiddlewareError::Execution(format!(
-            "unsupported MySQL time parameter payload length {}",
-            bytes.len()
-        )));
-    }
-    let is_negative = bytes[0];
-    let days = u32::from_le_bytes([bytes[1], bytes[2], bytes[3], bytes[4]]);
-    let hours = bytes[5];
-    let minutes = bytes[6];
-    let seconds = bytes[7];
-    let micros = if bytes.len() == 12 {
-        u32::from_le_bytes([bytes[8], bytes[9], bytes[10], bytes[11]])
-    } else {
-        0
-    };
-
-    let total_hours = days * 24 + u32::from(hours);
-    let sign = if is_negative != 0 { "-" } else { "" };
-    let fraction = if micros > 0 {
-        format!(".{micros:06}")
-    } else {
-        String::new()
-    };
-    Ok(format!("{sign}{total_hours:02}:{minutes:02}:{seconds:02}{fraction}"))
 }

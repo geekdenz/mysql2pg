@@ -204,6 +204,21 @@ pub trait AsyncMysqlShim<W: Send> {
         results: QueryResultWriter<'a, W>,
     ) -> Result<(), Self::Error>;
 
+    /// Called for immediate queries before assuming the payload is UTF-8.
+    ///
+    /// MySQL permits binary data in string literals. Backends that need to
+    /// preserve those bytes can override this method; text-only backends keep
+    /// the existing UTF-8 behavior through the default implementation.
+    async fn on_query_bytes<'a>(
+        &'a mut self,
+        query: &'a [u8],
+        results: QueryResultWriter<'a, W>,
+    ) -> Result<(), Self::Error> {
+        let query = ::std::str::from_utf8(query)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        self.on_query(query, results).await
+    }
+
     /// Called when client switches database.
     async fn on_init<'a>(
         &'a mut self,
@@ -568,13 +583,6 @@ where
 
         let mut stmts: HashMap<u32, _> = HashMap::new();
         while let Some((seq, packet)) = self.reader.next_async().await? {
-            eprintln!(
-                "mysql packet read seq={} len={} first_byte={:?} payload={:02x?}",
-                seq,
-                packet.len(),
-                packet.first().copied(),
-                packet.as_ref()
-            );
             if packet.is_empty() {
                 continue;
             }
@@ -607,14 +615,7 @@ where
                                         w.finish().await?;
                                     }
                                     _ => {
-                                        self.shim
-                                            .on_query(
-                                                ::std::str::from_utf8(q).map_err(|e| {
-                                                    io::Error::new(io::ErrorKind::InvalidData, e)
-                                                })?,
-                                                w,
-                                            )
-                                            .await?;
+                                        self.shim.on_query_bytes(q, w).await?;
                                     }
                                 }
                             } else if !self.process_use_statement_on_query
@@ -634,14 +635,7 @@ where
                                     false,
                                     self.client_capabilities,
                                 );
-                                self.shim
-                                    .on_query(
-                                        ::std::str::from_utf8(q).map_err(|e| {
-                                            io::Error::new(io::ErrorKind::InvalidData, e)
-                                        })?,
-                                        w,
-                                    )
-                                    .await?;
+                                self.shim.on_query_bytes(q, w).await?;
                             }
                         }
                         Command::Prepare(q) => {
