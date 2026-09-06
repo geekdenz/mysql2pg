@@ -30,8 +30,10 @@ ssh -N -L 18084:127.0.0.1:18084 tim@wmsvt.com
 ```
 
 Open `http://localhost:18084` and complete the Matomo wizard. The database fields
-are supplied by the container environment: host `middleware`, adapter `MYSQLI`,
+are supplied by the container environment: host `middleware`, adapter `PDO\MYSQL`,
 database and user `matomo`, prefix `matomo_`, and the generated database password.
+Select `MariaDB` as the database type. The `MYSQLI` adapter and `MySQL` database
+type do not follow the compatibility path used and tested by this deployment.
 Choose your administrator credentials and the website to track in the wizard.
 If the password field needs entering manually, retrieve `POSTGRES_PASSWORD` from
 the remote `shared/.env.remote`; do not commit or share this file.
@@ -41,9 +43,11 @@ pinned to `5.10.1-apache`. A healthy container proves HTTP and database connecti
 it does not mean the installation wizard has been completed.
 
 For public HTTPS access, configure a chosen hostname on the existing reverse
-proxy. The script does not change shared proxy configuration. If the proxy runs
-in Docker, it must join `matomo-mysql2pg_frontend` and route to
-`matomo-mysql2pg-matomo-1:80`; its own loopback address cannot reach the host port.
+proxy. Matomo joins the existing external Docker network `web` (override with
+`PROXY_NETWORK` in the remote environment file). The proxy must also be on that
+network and route to `matomo-mysql2pg-matomo-1:80`; its own loopback address cannot
+reach the host port. Only Matomo joins the proxy network; the middleware and
+PostgreSQL remain private. The script does not change shared proxy configuration.
 After HTTPS works, configure trusted hosts and proxy settings according to
 [Matomo's proxy documentation](https://matomo.org/faq/how-to-install/faq_98/).
 
@@ -79,8 +83,8 @@ Inspect the deployment:
 ssh tim@wmsvt.com
 cd ~/matomo-mysql2pg/current
 export DEPLOY_RELEASE="$(basename "$(pwd -P)")"
-docker compose --env-file ../..//shared/.env.remote -f compose.remote.yml ps
-docker compose --env-file ../..//shared/.env.remote -f compose.remote.yml logs --tail=100
+docker compose --env-file "$HOME/matomo-mysql2pg/shared/.env.remote" -f compose.remote.yml ps
+docker compose --env-file "$HOME/matomo-mysql2pg/shared/.env.remote" -f compose.remote.yml logs --tail=100
 ```
 
 The script retains old release images and directories for inspection or rollback;
@@ -88,3 +92,39 @@ it does not prune volumes. Matomo application code also persists in its volume.
 Changing `MATOMO_IMAGE_TAG` alone does not upgrade that code: perform Matomo's
 application/database update deliberately after a backup. Re-deployment does not
 reset the installer, run schema migrations, or replace administrator credentials.
+
+## MySQL/MariaDB builtin functions with no PostgreSQL equivalent
+
+Some MySQL/MariaDB builtin functions have no PostgreSQL equivalent (for example
+`CRC32()`, which Matomo calls on every tracking request to look up
+`matomo_log_action`). The middleware maintains a registry of these in
+`MYSQL_COMPAT_FUNCTIONS` (`src/executor.rs`) and creates matching PostgreSQL
+functions automatically: once eagerly on every startup (`CREATE OR REPLACE`, safe
+to repeat), and again just-in-time the first time any query hits PostgreSQL's
+"function does not exist" error for one of them. No manual migration step is
+needed, including after a fresh database or `reset-matomo.sh`.
+
+Currently covered: `CRC32`, `SHA2`, `WEEKDAY`, `DAYNAME`, `MONTHNAME`, `LOCATE`.
+(`MD5` needs nothing extra — PostgreSQL's native `md5()` already matches MySQL's
+signature and output. Functions whose MySQL syntax uses a bare keyword argument,
+such as `TIMESTAMPDIFF(unit, ...)` and `TIMESTAMPADD(unit, ...)`, can't be handled
+this way — PostgreSQL would see `unit` as an undefined column, not an undefined
+function, so those need a translator-level rewrite instead; see
+`rewrite_mysql_functions` in `src/translator.rs`.) Add another entry to
+`MYSQL_COMPAT_FUNCTIONS` for any other missing function as it's discovered — no
+other code changes are needed for it to install both eagerly and just-in-time.
+
+## Reset Matomo
+
+If an installation attempt leaves a partial schema and the data can be discarded,
+run:
+
+```bash
+./reset-matomo.sh
+```
+
+The script asks for confirmation, saves a PostgreSQL dump and Matomo configuration
+under the remote `backups/` directory, empties the Matomo schema, clears installer
+sessions and configuration, restarts Matomo, and waits for a healthy installation
+page. Use `./reset-matomo.sh --yes` for non-interactive operation. `DEPLOY_HOST` and
+`DEPLOY_DIR` use the same overrides as `deploy.sh`.

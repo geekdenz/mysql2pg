@@ -49,7 +49,7 @@ services:
     environment:
       PHP_MEMORY_LIMIT: 512M
       MATOMO_DATABASE_HOST: middleware
-      MATOMO_DATABASE_ADAPTER: MYSQLI
+      MATOMO_DATABASE_ADAPTER: PDO\MYSQL
       MATOMO_DATABASE_TABLES_PREFIX: matomo_
       MATOMO_DATABASE_USERNAME: matomo
       MATOMO_DATABASE_PASSWORD: ${POSTGRES_PASSWORD}
@@ -62,7 +62,7 @@ services:
     depends_on:
       middleware:
         condition: service_started
-    networks: [database, frontend]
+    networks: [database, frontend, proxy]
     healthcheck:
       test: [CMD, php, /opt/deployment/healthcheck.php]
       interval: 10s
@@ -92,6 +92,9 @@ networks:
   database:
     internal: true
   frontend:
+  proxy:
+    external: true
+    name: ${PROXY_NETWORK:-web}
 
 volumes:
   postgres_data:

@@ -123,6 +123,8 @@ To deploy Matomo and the middleware to `tim@wmsvt.com:matomo-mysql2pg`, run
 `./deploy.sh`. See [remote deployment](docs/deployment.md) for SSH access,
 persistent settings, first installation and backup behavior.
 
+To back up and reset an incomplete Matomo installation, run `./reset-matomo.sh`.
+
 ```bash
 cp .env.example .env
 docker compose up --build -d
@@ -193,7 +195,8 @@ This intentionally avoids reusing older Matomo app/config volumes that can conta
 The Matomo container does not set `MATOMO_DATABASE_*` environment variables. Configure the database manually in the installer. To test the middleware's MySQL-compatible frontend, use:
 
 - host: `middleware`
-- adapter: `MYSQLI`
+- adapter: `PDO\MYSQL`
+- database type: `MariaDB`
 - database: `app`
 - username: `anyuser`
 - password: `matomo`

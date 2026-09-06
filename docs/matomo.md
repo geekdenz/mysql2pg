@@ -41,7 +41,8 @@ The Matomo container does not set `MATOMO_DATABASE_*` environment variables, so 
 To test the middleware's MySQL-compatible frontend, enter:
 
 - host: `middleware`
-- adapter: `MYSQLI`
+- adapter: `PDO\MYSQL`
+- database type: `MariaDB`
 - database: `app`
 - username: `anyuser`
 - password: `matomo`
