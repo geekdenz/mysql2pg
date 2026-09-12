@@ -4,7 +4,10 @@ services:
       context: .
       dockerfile: Dockerfile
     env_file:
-      - .env
+      # Optional: every variable below has a default, so a fresh clone and CI
+      # work without a .env file. Local overrides are picked up when present.
+      - path: .env
+        required: false
     environment:
       MW_SERVER_BIND_ADDR: ${MW_SERVER_BIND_ADDR:-0.0.0.0:8080}
       MW_MYSQL_BIND_ADDR: ${MW_MYSQL_BIND_ADDR:-0.0.0.0:3306}
