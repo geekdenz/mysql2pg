@@ -6,7 +6,9 @@ Run from this checkout:
 ./deploy.sh
 ```
 
-The defaults deploy to `tim@wmsvt.com:matomo-mysql2pg`. You need SSH access,
+Set `DEPLOY_HOST` in `.env` to your SSH target (`user@host`); `DEPLOY_DIR`
+defaults to `matomo-mysql2pg`. Both scripts refuse to run without a host, and
+`.env` is git-ignored so the target stays out of the repository. You need SSH access,
 tar and Git locally, and Docker Compose, Bash, flock, OpenSSL and curl remotely.
 The script uploads only the middleware build inputs and deployment files from
 the working tree. It builds the middleware on the server, waits for PostgreSQL
@@ -26,7 +28,7 @@ and both middleware interfaces are confined to the deployment's private Docker
 network because middleware authentication is currently permissive.
 
 ```bash
-ssh -N -L 18084:127.0.0.1:18084 tim@wmsvt.com
+ssh -N -L 18084:127.0.0.1:18084 "$DEPLOY_HOST"
 ```
 
 Open `http://localhost:18084` and complete the Matomo wizard. The database fields
@@ -80,7 +82,7 @@ that it is waiting for setup, without trying to archive a missing schema.
 Inspect the deployment:
 
 ```bash
-ssh tim@wmsvt.com
+ssh "$DEPLOY_HOST"
 cd ~/matomo-mysql2pg/current
 export DEPLOY_RELEASE="$(basename "$(pwd -P)")"
 docker compose --env-file "$HOME/matomo-mysql2pg/shared/.env.remote" -f compose.remote.yml ps

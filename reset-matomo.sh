@@ -2,14 +2,28 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-DEPLOY_HOST="${DEPLOY_HOST:-tim@wmsvt.com}"
+
+# Read a single key from .env without sourcing it; the file holds values with
+# spaces (connection strings) that a shell would try to execute.
+read_env_key() {
+    local key="$1" file="$ROOT_DIR/.env" line
+    [[ -f "$file" ]] || return 0
+    line="$(grep -m1 -E "^[[:space:]]*${key}=" "$file")" || return 0
+    line="${line#*=}"
+    line="${line%$'\r'}"
+    line="${line%\"}"; line="${line#\"}"
+    line="${line%\'}"; line="${line#\'}"
+    printf '%s' "$line"
+}
+DEPLOY_HOST="${DEPLOY_HOST:-$(read_env_key DEPLOY_HOST)}"
+DEPLOY_DIR="${DEPLOY_DIR:-$(read_env_key DEPLOY_DIR)}"
 DEPLOY_DIR="${DEPLOY_DIR:-matomo-mysql2pg}"
 assume_yes=false
 
 if [[ "${1:-}" == --help ]]; then
     printf '%s\n' \
         'Usage: ./reset-matomo.sh [--yes]' \
-        'Defaults: DEPLOY_HOST=tim@wmsvt.com DEPLOY_DIR=matomo-mysql2pg' \
+        'Settings: DEPLOY_HOST (required; set it in .env) DEPLOY_DIR=matomo-mysql2pg' \
         'Backs up and deletes all Matomo database data and installer state.' \
         'Use --yes for non-interactive execution.'
     exit 0
@@ -21,6 +35,10 @@ fi
 [[ $# == 0 ]] || { echo 'Use --help for usage.' >&2; exit 2; }
 [[ "$DEPLOY_DIR" =~ ^[a-zA-Z0-9_-]+(/[a-zA-Z0-9_-]+)*$ ]] || {
     echo 'DEPLOY_DIR must be a simple path relative to the remote home directory.' >&2
+    exit 2
+}
+[[ -n "$DEPLOY_HOST" ]] || {
+    echo 'DEPLOY_HOST is not set. Add it to .env (see .env.example) or export it.' >&2
     exit 2
 }
 [[ "$DEPLOY_HOST" =~ ^[a-zA-Z0-9_][a-zA-Z0-9_.@-]*$ ]] || {

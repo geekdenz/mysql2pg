@@ -14,3 +14,9 @@ target/
 *.pdb
 
 # End of https://www.toptal.com/developers/gitignore/api/rust
+
+### Local environment ###
+# Never commit real credentials or deployment targets.
+.env
+.env.*
+!.env.example
