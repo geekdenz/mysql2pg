@@ -71,7 +71,33 @@ services:
       - matomo_data:/var/www/html
     command: ["sh", "-lc", "while true; do php /var/www/html/console core:archive --url=$${MATOMO_ARCHIVE_URL}; sleep 300; done"]
 
+  # SilverStripe CMS, configured with its stock MariaDB/PDO driver, pointed at
+  # the middleware. Nothing in the container knows PostgreSQL exists.
+  silverstripe:
+    build:
+      context: examples/silverstripe
+      dockerfile: Dockerfile
+    profiles: ["silverstripe"]
+    environment:
+      SS_DATABASE_CLASS: ${SS_DATABASE_CLASS:-MySQLPDODatabase}
+      SS_DATABASE_SERVER: ${SS_DATABASE_SERVER:-middleware}
+      SS_DATABASE_PORT: ${SS_DATABASE_PORT:-3306}
+      SS_DATABASE_NAME: ${SS_DATABASE_NAME:-silverstripe}
+      SS_DATABASE_USERNAME: ${SS_DATABASE_USERNAME:-anyuser}
+      SS_DATABASE_PASSWORD: ${SS_DATABASE_PASSWORD:-matomo}
+      SS_ENVIRONMENT_TYPE: ${SS_ENVIRONMENT_TYPE:-dev}
+      SS_DEFAULT_ADMIN_USERNAME: ${SS_DEFAULT_ADMIN_USERNAME:-admin}
+      SS_DEFAULT_ADMIN_PASSWORD: ${SS_DEFAULT_ADMIN_PASSWORD:-password}
+    ports:
+      - "${SILVERSTRIPE_PORT:-8082}:80"
+    depends_on:
+      middleware:
+        condition: service_started
+    volumes:
+      - silverstripe_assets:/var/www/html/public/assets
+
 volumes:
   postgres_data:
+  silverstripe_assets:
   matomo_data:
     name: ${MATOMO_DATA_VOLUME:-mysql2pg-middleware_matomo_manual_install_data}

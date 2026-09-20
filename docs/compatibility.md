@@ -107,6 +107,43 @@ The middleware targets MySQL/MariaDB *dialect* compatibility, not any one
 application. Nothing in the translation or execution path is keyed on a particular
 schema or table name, with the single documented exception below.
 
+### Proofs
+
+Two applications are carried end to end, plus a synthetic suite:
+
+| proof | what it covers |
+|---|---|
+| `tests/generic-app-smoke.sh` | a plain inventory schema over the MySQL protocol, no application involved |
+| Matomo | see [matomo.md](matomo.md) — tracking and report archiving |
+| `examples/silverstripe/` | SilverStripe CMS on its MariaDB/PDO driver; `smoke.sh` builds the schema, drives the ORM, then reads the rows back with `psql` |
+
+SilverStripe is a deliberately different shape from Matomo: a different ORM, a
+different quoting convention (`ANSI_QUOTES`), and heavy schema introspection.
+
+### Schema introspection
+
+`SHOW FULL FIELDS` / `DESCRIBE` reconstruct a column's MySQL type from the
+PostgreSQL catalog, because clients compare the reported type against the type
+they declared. `integer` is reported as `int(11)`, `character varying(n)` as
+`varchar(n)`, `numeric(p,s)` as `decimal(p,s)`, `timestamp` as `datetime`, and
+defaults are stripped of their PostgreSQL casts (`'0'::smallint` becomes `0`).
+
+This is a reconstruction, not a recording, so it cannot be exact where several
+MySQL types collapse onto one PostgreSQL type: `enum(...)` comes back as
+`mediumtext`, `tinyint(1) unsigned` as `smallint(6)`, and character set and
+collation clauses are lost. Applications that reconcile their schema on every
+startup may therefore keep trying to `ALTER` those columns. Recording the
+declared type (for example in a column comment) and replaying it would close
+this; see the limitation section in `examples/silverstripe/README.md`.
+
+### `sql_mode` awareness
+
+The session's `sql_mode` is tracked per connection. When it enables `ANSI` or
+`ANSI_QUOTES`, double-quoted tokens are treated as identifiers instead of
+string literals, matching MySQL. Clients that never set the mode are
+unaffected. The value is picked up whether it is sent inline or bound as a
+parameter of a prepared `SET sql_mode = ?`.
+
 ### Dialect gaps handled generally
 
 These are MySQL behaviors PostgreSQL does not share. Each is resolved from the

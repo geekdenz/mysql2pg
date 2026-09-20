@@ -125,6 +125,15 @@ persistent settings, first installation and backup behavior.
 
 To back up and reset an incomplete Matomo installation, run `./reset-matomo.sh`.
 
+A second, unrelated application is carried end to end as a compatibility proof:
+SilverStripe CMS on its stock MariaDB/PDO driver. See
+[examples/silverstripe](examples/silverstripe/README.md).
+
+```bash
+docker compose --profile silverstripe up -d --build
+./examples/silverstripe/smoke.sh
+```
+
 ```bash
 cp .env.example .env
 docker compose up --build -d
