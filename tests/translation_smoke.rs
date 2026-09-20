@@ -493,3 +493,104 @@ fn local_load_data_has_explicit_wire_protocol_error() {
     .unwrap_err();
     assert!(error.to_string().contains("client-local-infile wire support"));
 }
+
+fn ansi_quotes_config() -> TranslatorConfig {
+    TranslatorConfig { ansi_quotes: true, ..TranslatorConfig::default() }
+}
+
+#[test]
+fn ansi_quotes_mode_treats_double_quotes_as_identifiers() {
+    // SilverStripe sets sql_mode = 'ANSI', after which "Title" names a column.
+    let sql = r#"SELECT "Title" FROM "ProofRecord" WHERE "Active" = 1"#;
+    let result = translate_sql(sql, &ansi_quotes_config()).unwrap();
+
+    assert!(result.translated_sql.contains("\"Title\""));
+    assert!(result.translated_sql.contains("FROM \"ProofRecord\""));
+    // It must not have become a string literal.
+    assert!(!result.translated_sql.contains("'Title'"));
+}
+
+#[test]
+fn ansi_quotes_mode_still_parses_create_table() {
+    let sql = r#"CREATE TABLE "ProofRecord" ("ID" int(11) not null auto_increment, "Title" varchar(255), primary key ("ID")) ENGINE=InnoDB"#;
+    let result = translate_sql(sql, &ansi_quotes_config()).unwrap();
+
+    assert!(result.translated_sql.contains("\"ProofRecord\""));
+    assert!(result.translated_sql.contains("\"ID\""));
+    assert!(!result.translated_sql.to_uppercase().contains("ENGINE"));
+}
+
+#[test]
+fn ansi_quotes_mode_leaves_string_literals_alone() {
+    let sql = r#"SELECT "Title" FROM "ProofRecord" WHERE "Title" = 'a "quoted" word'"#;
+    let result = translate_sql(sql, &ansi_quotes_config()).unwrap();
+
+    assert!(result.translated_sql.contains(r#"'a "quoted" word'"#));
+}
+
+#[test]
+fn without_ansi_quotes_double_quotes_remain_string_literals() {
+    // Default MySQL behaviour, which Matomo and most clients rely on.
+    let sql = r#"SELECT "literal" AS v"#;
+    let result = translate_sql(sql, &TranslatorConfig::default()).unwrap();
+
+    assert!(result.translated_sql.contains("'literal'"));
+}
+
+#[test]
+fn show_full_tables_with_where_filters_on_table_type() {
+    // SilverStripe and phpMyAdmin both list base tables this way.
+    let sql = "SHOW FULL TABLES WHERE Table_Type != 'VIEW'";
+    let result = translate_sql(sql, &TranslatorConfig::default()).unwrap();
+
+    assert!(result.translated_sql.contains("information_schema.tables"));
+    assert!(result.translated_sql.contains("Table_type"));
+    // The predicate must survive, and resolve against a lowercase alias so that
+    // PostgreSQL's identifier folding matches MySQL's mixed-case column name.
+    // sqlparser renders `!=` as the standard `<>`.
+    assert!(result.translated_sql.contains("Table_Type <> 'VIEW'"));
+    assert!(result.translated_sql.contains("AS table_type"));
+}
+
+#[test]
+fn show_tables_without_where_keeps_the_simple_form() {
+    let result = translate_sql("SHOW TABLES", &TranslatorConfig::default()).unwrap();
+    assert!(result.translated_sql.contains("information_schema.tables"));
+    assert!(!result.translated_sql.contains("AS show_tables"));
+}
+
+#[test]
+fn show_table_status_reports_innodb_and_a_utf8mb4_collation() {
+    let result = translate_sql("SHOW TABLE STATUS LIKE 'SiteTree'", &TranslatorConfig::default()).unwrap();
+
+    assert!(result.translated_sql.contains("pg_class"));
+    assert!(result.translated_sql.contains("'InnoDB' AS \"Engine\""));
+    assert!(result.translated_sql.contains("utf8mb4_unicode_ci"));
+    assert!(result.translated_sql.contains("LIKE 'SiteTree'"));
+}
+
+#[test]
+fn show_table_status_without_a_pattern_lists_every_table() {
+    let result = translate_sql("SHOW TABLE STATUS", &TranslatorConfig::default()).unwrap();
+
+    assert!(result.translated_sql.contains("pg_class"));
+    assert!(!result.translated_sql.contains("LIKE"));
+}
+
+#[test]
+fn show_indexes_accepts_in_as_well_as_from() {
+    for sql in ["SHOW INDEX FROM `ProofRecord`", "SHOW KEYS IN ProofRecord"] {
+        let result = translate_sql(sql, &TranslatorConfig::default())
+            .unwrap_or_else(|e| panic!("{sql} failed: {e}"));
+        assert!(result.translated_sql.contains("Key_name"), "{sql}");
+        assert!(result.translated_sql.contains("ProofRecord"), "{sql}");
+    }
+}
+
+#[test]
+fn show_indexes_accepts_ansi_quoted_table_names() {
+    // Only under ANSI_QUOTES is "ProofRecord" a table rather than a string.
+    let result = translate_sql("SHOW INDEXES IN \"ProofRecord\"", &ansi_quotes_config()).unwrap();
+    assert!(result.translated_sql.contains("Key_name"));
+    assert!(result.translated_sql.contains("ProofRecord"));
+}

@@ -3,6 +3,7 @@ use std::{
     io,
     sync::{
         atomic::{AtomicU32, Ordering},
+        OnceLock,
         Arc, LazyLock, Mutex,
     },
 };
@@ -18,10 +19,10 @@ use sqlparser::ast::{Expr, Query, SelectItem, SetExpr, Statement};
 use tokio::{io::split, net::TcpListener};
 
 use crate::{
-    config::AppConfig,
+    config::{AppConfig, TranslatorConfig},
     error::MiddlewareError,
     executor::{PgParam, PostgresExecutor, QueryResult, SessionPostgresExecutor},
-    parser::parse_mysql_sql,
+    parser::{parse_mysql_sql, parse_postgres_sql},
     translator::{translate_sql, TranslationResult},
 };
 
@@ -279,7 +280,8 @@ where
             return Ok(());
         }
 
-        let translated = match translate_preparable_sql(query, &self.config.translator) {
+        let session_cfg = translator_config_for_session(&self.config.translator, &self.session_sql_mode);
+        let translated = match translate_preparable_sql(query, &session_cfg) {
             Ok(result) => result.translated_sql,
             Err(err) => {
                 tracing::warn!("mysql prepare translation failed for `{}`: {}", query, err);
@@ -367,6 +369,25 @@ where
         }
 
         if postgres_sql.is_empty() {
+            // SilverStripe (and others) set the mode with `SET sql_mode = ?`,
+            // so the value arrives as a bound parameter rather than inline.
+            if is_set_sql_mode_query(&original_sql.trim().to_ascii_uppercase())
+                && original_sql.contains('?')
+            {
+                if let Ok(decoded) = decode_mysql_params(params) {
+                    // Clients bind this as either a text or a binary string.
+                    let value = match decoded.first() {
+                        Some(PgParam::Text(value)) => Some(value.clone()),
+                        Some(PgParam::Bytes(bytes)) => String::from_utf8(bytes.clone()).ok(),
+                        _ => None,
+                    };
+                    if let Some(value) = value {
+                        self.session_sql_mode = value;
+                    }
+                }
+                results.completed(OkResponse::default()).await?;
+                return Ok(());
+            }
             match handle_mysql_session_query(self, &original_sql) {
                 Ok(Some(response)) => {
                     results.completed(response).await?;
@@ -531,7 +552,8 @@ where
             return Ok(());
         }
 
-        let translated = match translate_sql(trimmed, &self.config.translator) {
+        let session_cfg = translator_config_for_session(&self.config.translator, &self.session_sql_mode);
+        let translated = match translate_sql(trimmed, &session_cfg) {
             Ok(result) => result.translated_sql,
             Err(err) => {
                 tracing::warn!("mysql query translation failed for `{}`: {}", trimmed, err);
@@ -674,7 +696,19 @@ fn make_param_column(index: usize) -> Column {
 }
 
 fn infer_result_columns(query: &str) -> Vec<String> {
-    let Ok(statements) = parse_mysql_sql(query) else {
+    infer_result_columns_with(query, parse_mysql_sql)
+}
+
+/// Column names for SQL that is already in PostgreSQL form.
+fn infer_result_columns_postgres(query: &str) -> Vec<String> {
+    infer_result_columns_with(query, parse_postgres_sql)
+}
+
+fn infer_result_columns_with(
+    query: &str,
+    parse: fn(&str) -> Result<Vec<Statement>, MiddlewareError>,
+) -> Vec<String> {
+    let Ok(statements) = parse(query) else {
         return Vec::new();
     };
     let Some(statement) = statements.first() else {
@@ -694,15 +728,42 @@ fn infer_prepare_result_columns(original_sql: &str, translated_sql: &str) -> Vec
 
     let columns = infer_result_columns(original_sql);
     if !columns.is_empty() {
-        return columns;
+        return columns.iter().map(|name| unqualify_column_label(name)).collect();
     }
 
-    let translated_columns = infer_result_columns(translated_sql);
+    let translated_columns = infer_result_columns_postgres(translated_sql);
     if translated_columns.iter().any(|name| name == "*") {
         Vec::new()
     } else {
         translated_columns
+            .iter()
+            .map(|name| unqualify_column_label(name))
+            .collect()
     }
+}
+
+/// MySQL labels a result column with the bare column name, never with the
+/// table qualifier or the quotes around it, so `"SiteTree"."ClassName"` has to
+/// come back as `ClassName`. Anything that is not a plain qualified identifier
+/// (a function call, an arithmetic expression) is left exactly as it is.
+fn unqualify_column_label(name: &str) -> String {
+    static QUALIFIED: OnceLock<Regex> = OnceLock::new();
+    let pattern = QUALIFIED.get_or_init(|| {
+        Regex::new(
+            r#"(?x)^
+            (?: "[^"]+" | `[^`]+` | [A-Za-z_][A-Za-z0-9_$]* )
+            (?: \s*\.\s* (?: "[^"]+" | `[^`]+` | [A-Za-z_][A-Za-z0-9_$]* ) )*
+            $"#,
+        )
+        .expect("valid qualified identifier regex")
+    });
+
+    if !pattern.is_match(name) {
+        return name.to_string();
+    }
+
+    let last = name.rsplit('.').next().unwrap_or(name).trim();
+    last.trim_matches('"').trim_matches('`').to_string()
 }
 
 fn compat_prepare_columns_for_query(query: &str) -> Option<Vec<String>> {
@@ -957,6 +1018,14 @@ fn handle_mysql_session_query(
         return Ok(Some(OkResponse::default()));
     }
 
+    if upper.starts_with("USE ") {
+        if let Some(database_name) = parse_use_database_name(trimmed) {
+            backend.current_db = Some(database_name.clone());
+            set_default_database_name(Some(&database_name));
+        }
+        return Ok(Some(OkResponse::default()));
+    }
+
     if upper.starts_with("SET SESSION TRANSACTION ISOLATION LEVEL ") {
         let level = trimmed["SET SESSION TRANSACTION ISOLATION LEVEL ".len()..].trim();
         backend.transaction_isolation = normalize_transaction_isolation(level);
@@ -1067,6 +1136,25 @@ fn normalize_transaction_isolation(level: &str) -> String {
         .to_ascii_uppercase()
 }
 
+/// True when a session sql_mode makes double quotes delimit identifiers.
+fn sql_mode_enables_ansi_quotes(sql_mode: &str) -> bool {
+    sql_mode.split(',').any(|flag| {
+        let flag = flag.trim();
+        flag.eq_ignore_ascii_case("ANSI") || flag.eq_ignore_ascii_case("ANSI_QUOTES")
+    })
+}
+
+/// The translator config for this connection, with the ANSI_QUOTES flag taken
+/// from whatever sql_mode the client last set.
+fn translator_config_for_session(
+    base: &TranslatorConfig,
+    session_sql_mode: &str,
+) -> TranslatorConfig {
+    let mut cfg = base.clone();
+    cfg.ansi_quotes = sql_mode_enables_ansi_quotes(session_sql_mode);
+    cfg
+}
+
 fn is_set_sql_mode_query(upper: &str) -> bool {
     upper.starts_with("SET SQL_MODE")
         || upper.starts_with("SET SESSION SQL_MODE")
@@ -1093,6 +1181,7 @@ fn is_compat_noop_query(query: &str) -> bool {
     normalized.starts_with("SET NAMES ")
         || normalized.starts_with("SET SQL_MODE")
         || is_set_sql_mode_query(&normalized)
+        || normalized.starts_with("USE ")
         || normalized.starts_with("CREATE DATABASE ")
         || normalized.starts_with("DROP DATABASE ")
         || is_mysql_session_compat_noop(&normalized)
@@ -1146,6 +1235,12 @@ fn parse_database_name(sql: &str, prefix: &str) -> Option<String> {
 fn parse_create_database_name(sql: &str) -> Option<String> {
     parse_database_name(sql, "CREATE DATABASE")
         .or_else(|| parse_database_name(sql, "create database"))
+}
+
+/// `USE <db>` is the statement form of COM_INIT_DB, so it selects the schema
+/// the session resolves unqualified table names against.
+fn parse_use_database_name(sql: &str) -> Option<String> {
+    parse_database_name(sql, "USE").or_else(|| parse_database_name(sql, "use"))
 }
 
 fn parse_drop_database_name(sql: &str) -> Option<String> {

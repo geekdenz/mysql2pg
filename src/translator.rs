@@ -72,7 +72,13 @@ fn translate_sql_uncached(sql: &str, cfg: &TranslatorConfig) -> Result<Translati
     let (sql, rewrote_ranking_query) = rewrite_mysql_ranking_query(&sql);
     let (sql, inlined_session_variables) = inline_session_variable_expressions(&sql);
 
-    let mysql_sql = normalize_mysql_double_quoted_string_literals(&sql);
+    // Under ANSI_QUOTES a double-quoted token is an identifier, not a string.
+    // Convert those to backticks so the rest of the MySQL pipeline is unchanged.
+    let mysql_sql = if cfg.ansi_quotes {
+        convert_ansi_quoted_identifiers_to_backticks(&sql)
+    } else {
+        normalize_mysql_double_quoted_string_literals(&sql)
+    };
     let direct_translation = translate_unparsed_sql(&mysql_sql)?;
     let statements = match direct_translation.as_ref() {
         Some(_) => Vec::new(),
@@ -841,7 +847,76 @@ fn translate_unparsed_sql(
         return Ok(Some((sql.trim().to_string(), translated_sql, warnings)));
     }
 
+    if let Some((translated_sql, warnings)) = translate_show_table_status_direct(sql)? {
+        return Ok(Some((sql.trim().to_string(), translated_sql, warnings)));
+    }
+
     Ok(None)
+}
+
+/// `SHOW TABLE STATUS [LIKE 'pattern']` -> an information_schema query shaped
+/// like MySQL's result.
+///
+/// Clients use this to inspect a table's storage engine and collation before
+/// deciding whether to rewrite it. Reporting InnoDB and a utf8mb4 collation
+/// keeps them on the path they would take against a modern MySQL, and the
+/// size columns are filled in from PostgreSQL's own statistics where there is
+/// a sensible equivalent.
+fn translate_show_table_status_direct(
+    sql: &str,
+) -> Result<Option<(String, Vec<String>)>, MiddlewareError> {
+    let pattern = Regex::new(
+        r#"(?is)^\s*SHOW\s+TABLE\s+STATUS(?:\s+(?:FROM|IN)\s+(?:`([^`]+)`|"([^"]+)"|([A-Za-z_][A-Za-z0-9_$]*)))?(?:\s+LIKE\s+'([^']*)')?\s*;?\s*$"#,
+    )
+    .expect("valid SHOW TABLE STATUS regex");
+    let Some(caps) = pattern.captures(sql) else {
+        return Ok(None);
+    };
+
+    let schema_expr = caps
+        .get(1)
+        .or_else(|| caps.get(2))
+        .or_else(|| caps.get(3))
+        .map(|m| sql_string_literal(m.as_str()))
+        .unwrap_or_else(|| "current_schema()".to_string());
+
+    let mut translated = format!(
+        "SELECT c.relname AS \"Name\", \
+                'InnoDB' AS \"Engine\", \
+                10 AS \"Version\", \
+                'Dynamic' AS \"Row_format\", \
+                GREATEST(c.reltuples, 0)::bigint AS \"Rows\", \
+                0::bigint AS \"Avg_row_length\", \
+                pg_table_size(c.oid)::bigint AS \"Data_length\", \
+                0::bigint AS \"Max_data_length\", \
+                pg_indexes_size(c.oid)::bigint AS \"Index_length\", \
+                0::bigint AS \"Data_free\", \
+                NULL::bigint AS \"Auto_increment\", \
+                NULL::timestamp AS \"Create_time\", \
+                NULL::timestamp AS \"Update_time\", \
+                NULL::timestamp AS \"Check_time\", \
+                'utf8mb4_unicode_ci' AS \"Collation\", \
+                NULL::text AS \"Checksum\", \
+                '' AS \"Create_options\", \
+                COALESCE(obj_description(c.oid, 'pg_class'), '') AS \"Comment\" \
+         FROM pg_class c \
+         JOIN pg_namespace n ON n.oid = c.relnamespace \
+         WHERE n.nspname = {schema_expr} AND c.relkind IN ('r', 'p', 'v')"
+    );
+
+    if let Some(like) = caps.get(4) {
+        translated.push_str(&format!(
+            " AND c.relname LIKE {}",
+            sql_string_literal(like.as_str())
+        ));
+    }
+
+    translated.push_str(" ORDER BY c.relname");
+
+    Ok(Some((
+        translated,
+        vec!["rewrote MySQL SHOW TABLE STATUS to a pg_class query".to_string()],
+    )))
 }
 
 fn translate_load_data_direct(
@@ -983,6 +1058,62 @@ fn statement_requires_unsupported_rejection(stmt: &Statement) -> bool {
 
 fn replace_backticks(sql: &str) -> String {
     sql.replace('`', "\"")
+}
+
+/// Rewrite ANSI_QUOTES identifiers (`"name"`) into MySQL backtick form.
+///
+/// Single-quoted strings and already-backticked identifiers are copied through
+/// untouched so that a quote inside a literal is never mistaken for a delimiter.
+fn convert_ansi_quoted_identifiers_to_backticks(sql: &str) -> String {
+    let mut out = String::with_capacity(sql.len());
+    let mut chars = sql.chars().peekable();
+
+    while let Some(ch) = chars.next() {
+        match ch {
+            '\'' | '`' => {
+                let quote = ch;
+                out.push(ch);
+                while let Some(inner) = chars.next() {
+                    out.push(inner);
+                    if inner == '\\' && quote == '\'' {
+                        if let Some(next) = chars.next() {
+                            out.push(next);
+                        }
+                        continue;
+                    }
+                    if inner == quote {
+                        if chars.peek() == Some(&quote) {
+                            if let Some(next) = chars.next() {
+                                out.push(next);
+                            }
+                            continue;
+                        }
+                        break;
+                    }
+                }
+            }
+            '"' => {
+                let mut value = String::new();
+                while let Some(inner) = chars.next() {
+                    if inner == '"' {
+                        if chars.peek() == Some(&'"') {
+                            chars.next();
+                            value.push('"');
+                            continue;
+                        }
+                        break;
+                    }
+                    value.push(inner);
+                }
+                out.push('`');
+                out.push_str(&value.replace('`', "``"));
+                out.push('`');
+            }
+            _ => out.push(ch),
+        }
+    }
+
+    out
 }
 
 fn normalize_mysql_double_quoted_string_literals(sql: &str) -> String {
@@ -1868,9 +1999,44 @@ fn translate_describe_like_query(
         .unwrap_or_else(|| "current_schema()".to_string());
     let relation_expr = sql_string_literal(&relation_name);
 
+    // Introspecting clients compare the reported column type against the MySQL
+    // type they asked for, so reporting PostgreSQL's own spelling ("integer",
+    // "character varying") makes them rewrite every column on every run. Map
+    // back to MySQL's names instead.
+    let format_type = "pg_catalog.format_type(a.atttypid, a.atttypmod)";
+    let mysql_type_expr = format!(
+        "CASE \
+            WHEN {format_type} = 'integer' THEN 'int(11)' \
+            WHEN {format_type} = 'smallint' THEN 'smallint(6)' \
+            WHEN {format_type} = 'bigint' THEN 'bigint(20)' \
+            WHEN {format_type} = 'boolean' THEN 'tinyint(1)' \
+            WHEN {format_type} = 'text' THEN 'mediumtext' \
+            WHEN {format_type} = 'double precision' THEN 'double' \
+            WHEN {format_type} = 'real' THEN 'float' \
+            WHEN {format_type} = 'bytea' THEN 'blob' \
+            WHEN {format_type} IN ('json', 'jsonb') THEN 'json' \
+            WHEN {format_type} LIKE 'character varying%' THEN replace({format_type}, 'character varying', 'varchar') \
+            WHEN {format_type} LIKE 'character%' THEN replace({format_type}, 'character', 'char') \
+            WHEN {format_type} LIKE 'numeric%' THEN replace({format_type}, 'numeric', 'decimal') \
+            WHEN {format_type} LIKE 'timestamp%' THEN 'datetime' \
+            WHEN {format_type} LIKE 'time%' THEN 'time' \
+            ELSE {format_type} \
+        END"
+    );
+
+    // PostgreSQL reports defaults as typed literals (`'0'::smallint`); MySQL
+    // reports the bare value, and a sequence default is reported as no default.
+    let mysql_default_expr = "CASE \
+            WHEN c.column_default IS NULL THEN NULL \
+            WHEN c.column_default LIKE 'nextval(%' THEN NULL \
+            ELSE regexp_replace( \
+                     regexp_replace(c.column_default, '::[A-Za-z0-9_ ]+(\\[\\])?$', ''), \
+                     '^''(.*)''$', '\\1') \
+        END";
+
     let mut sql = format!(
         "SELECT c.column_name AS \"Field\", \
-                pg_catalog.format_type(a.atttypid, a.atttypmod) AS \"Type\", \
+                {mysql_type_expr} AS \"Type\", \
                 CASE WHEN c.is_nullable = 'YES' THEN 'YES' ELSE 'NO' END AS \"Null\", \
                 CASE \
                     WHEN EXISTS ( \
@@ -1898,7 +2064,7 @@ fn translate_describe_like_query(
                     ) THEN 'MUL' \
                     ELSE '' \
                 END AS \"Key\", \
-                c.column_default AS \"Default\", \
+                {mysql_default_expr} AS \"Default\", \
                 CASE \
                     WHEN c.is_identity = 'YES' THEN 'auto_increment' \
                     WHEN pg_get_expr(ad.adbin, ad.adrelid) LIKE 'nextval(%' THEN 'auto_increment' \
@@ -1952,6 +2118,31 @@ fn translate_show_tables(
     }
 
     let (schema_expr, column_alias) = resolve_show_tables_schema(show_options)?;
+
+    // `SHOW [FULL] TABLES WHERE ...` filters on MySQL's synthetic columns
+    // (`Table_type`, `Tables_in_<db>`). Those are projected as quoted,
+    // mixed-case aliases, which PostgreSQL will not match against the unquoted
+    // identifiers the filter uses. Expose lowercase aliases in a subquery
+    // instead, so PostgreSQL's own identifier folding lines the two up.
+    if let Some(ShowStatementFilter::Where(predicate)) = extract_show_filter(show_options) {
+        let projection = if full {
+            format!("table_name AS \"{column_alias}\", table_type AS \"Table_type\"")
+        } else {
+            format!("table_name AS \"{column_alias}\"")
+        };
+        let sql = format!(
+            "SELECT {projection} FROM ( \
+                SELECT table_name, table_name AS {}, \
+                       CASE WHEN table_type = 'VIEW' THEN 'VIEW' ELSE 'BASE TABLE' END AS table_type \
+                FROM information_schema.tables \
+                WHERE table_schema = {schema_expr} AND table_type IN ('BASE TABLE', 'VIEW') \
+            ) AS show_tables WHERE {predicate} ORDER BY table_name",
+            column_alias.to_ascii_lowercase()
+        );
+        warnings.push("rewrote MySQL SHOW TABLES ... WHERE to information_schema query".to_string());
+        return Ok(sql);
+    }
+
     let object_type_expr = if full {
         "CASE WHEN table_type = 'VIEW' THEN 'VIEW' ELSE 'BASE TABLE' END AS \"Table_type\""
     } else {
@@ -2399,7 +2590,9 @@ fn translate_named_filter(
 
 fn translate_show_index_direct(sql: &str) -> Result<Option<(String, Vec<String>)>, MiddlewareError> {
     let pattern = Regex::new(
-        r#"(?is)^\s*SHOW\s+(?:INDEX|INDEXES|KEYS)\s+FROM\s+(?:`([A-Za-z_][A-Za-z0-9_]*)`|([A-Za-z_][A-Za-z0-9_]*))(?:\s+WHERE\s+Key_name\s*=\s*(\?|'.*?'|".*?"))?\s*;?\s*$"#,
+        // MySQL accepts FROM or IN here, and the table may be quoted with
+        // backticks or - under ANSI_QUOTES - double quotes.
+        r#"(?is)^\s*SHOW\s+(?:INDEX|INDEXES|KEYS)\s+(?:FROM|IN)\s+(?:`([^`]+)`|"([^"]+)"|([A-Za-z_][A-Za-z0-9_$]*))(?:\s+WHERE\s+Key_name\s*=\s*(\?|'.*?'|".*?"))?\s*;?\s*$"#,
     )
     .expect("valid show index regex");
     let Some(caps) = pattern.captures(sql) else {
@@ -2409,9 +2602,10 @@ fn translate_show_index_direct(sql: &str) -> Result<Option<(String, Vec<String>)
     let table_name = caps
         .get(1)
         .or_else(|| caps.get(2))
+        .or_else(|| caps.get(3))
         .map(|m| m.as_str())
         .ok_or_else(|| MiddlewareError::Translation("failed to extract SHOW INDEX table name".to_string()))?;
-    let key_name_filter = caps.get(3).map(|m| m.as_str().trim());
+    let key_name_filter = caps.get(4).map(|m| m.as_str().trim());
     let filter_expr = match key_name_filter {
         Some("?") => "\"Key_name\" = $1".to_string(),
         Some(value) if (value.starts_with('\'') && value.ends_with('\'')) || (value.starts_with('"') && value.ends_with('"')) => {

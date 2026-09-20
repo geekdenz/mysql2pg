@@ -41,11 +41,16 @@ pub struct TranslatorConfig {
     pub rewrite_json_operators: bool,
     #[serde(default = "default_strip_engine_clauses")]
     pub strip_mysql_table_options: bool,
+    /// Set when the client's session sql_mode enables ANSI_QUOTES, which makes
+    /// double quotes delimit identifiers rather than string literals.
+    #[serde(default = "default_ansi_quotes")]
+    pub ansi_quotes: bool,
 }
 
 fn default_http_bind_addr() -> String { "0.0.0.0:8080".to_string() }
 fn default_mysql_bind_addr() -> String { "0.0.0.0:3306".to_string() }
 fn default_driver() -> String { "tokio-postgres".to_string() }
+fn default_ansi_quotes() -> bool { false }
 fn default_rewrite_limit_comma() -> bool { true }
 fn default_mysql_backticks() -> bool { true }
 fn default_boolean_literals() -> bool { true }
@@ -71,6 +76,8 @@ impl Default for TranslatorConfig {
             rewrite_mysql_functions: true,
             rewrite_json_operators: true,
             strip_mysql_table_options: true,
+            // Session-derived: set per connection from the client's sql_mode.
+            ansi_quotes: default_ansi_quotes(),
         }
     }
 }
@@ -108,6 +115,8 @@ impl AppConfig {
                 rewrite_mysql_functions: env_bool("MW_TRANSLATOR_REWRITE_MYSQL_FUNCTIONS", default_mysql_functions()),
                 rewrite_json_operators: env_bool("MW_TRANSLATOR_REWRITE_JSON_OPERATORS", default_json_operators()),
                 strip_mysql_table_options: env_bool("MW_TRANSLATOR_STRIP_MYSQL_TABLE_OPTIONS", default_strip_engine_clauses()),
+                // Session-derived: set per connection from the client's sql_mode.
+                ansi_quotes: default_ansi_quotes(),
             },
         })
     }
