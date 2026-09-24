@@ -9,7 +9,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         git unzip libicu-dev libzip-dev libpng-dev libjpeg62-turbo-dev libfreetype6-dev \
         default-mysql-client \
     && docker-php-ext-configure gd --with-freetype --with-jpeg \
-    && docker-php-ext-install -j"$(nproc)" pdo_mysql intl zip gd \
+    && docker-php-ext-install -j"$(nproc)" pdo_mysql mysqli intl zip gd \
     && a2enmod rewrite \
     && rm -rf /var/lib/apt/lists/*
 
@@ -30,6 +30,7 @@ RUN sed -ri -e 's!/var/www/html!${APACHE_DOCUMENT_ROOT}!g' \
         /etc/apache2/sites-available/*.conf /etc/apache2/apache2.conf
 
 COPY app/ /var/www/html/app/
+COPY mysqli-probe.php /usr/local/bin/mysqli-probe.php
 COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 RUN chmod +x /usr/local/bin/docker-entrypoint.sh \
     && chown -R www-data:www-data /var/www/html

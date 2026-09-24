@@ -34,8 +34,12 @@ ssh -N -L 18084:127.0.0.1:18084 "$DEPLOY_HOST"
 Open `http://localhost:18084` and complete the Matomo wizard. The database fields
 are supplied by the container environment: host `middleware`, adapter `PDO\MYSQL`,
 database and user `matomo`, prefix `matomo_`, and the generated database password.
-Select `MariaDB` as the database type. The `MYSQLI` adapter and `MySQL` database
-type do not follow the compatibility path used and tested by this deployment.
+Select `MariaDB` as the database type. `PDO\MYSQL` is what this deployment is
+installed and tested with; the middleware does support mysqli clients (see the
+client-library notes in [compatibility.md](compatibility.md)), but Matomo's own
+`MYSQLI` adapter has not been exercised end to end here, so prefer `PDO\MYSQL`
+unless you are deliberately testing it. The `MySQL` database type does not
+follow the compatibility path used by this deployment.
 Choose your administrator credentials and the website to track in the wizard.
 If the password field needs entering manually, retrieve `POSTGRES_PASSWORD` from
 the remote `shared/.env.remote`; do not commit or share this file.

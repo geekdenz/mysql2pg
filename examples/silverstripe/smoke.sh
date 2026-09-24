@@ -1,67 +1,90 @@
 #!/usr/bin/env bash
-# Proves SilverStripe runs on PostgreSQL through the middleware.
+# Proves SilverStripe runs on PostgreSQL through the middleware, over both of
+# the MySQL client libraries PHP ships: PDO (pdo_mysql) and mysqli.
 #
 #   docker compose --profile silverstripe up -d --build
-#   ./examples/silverstripe/smoke.sh
+#   ./examples/silverstripe/smoke.sh            # both connectors
+#   ./examples/silverstripe/smoke.sh mysqli     # just one (pdo|mysqli|probe)
 #
-# The decisive checks are the last ones: rows written through SilverStripe's
-# MariaDB/PDO driver are read straight back out of PostgreSQL with psql.
-#
-# The example lives in its own "silverstripe" PostgreSQL schema, which this
-# script drops first so the run is repeatable and independent of whatever else
-# the local stack has in it.
+# Each connector gets its own PostgreSQL schema, dropped first, so the runs are
+# independent and repeatable. The decisive checks are the last ones in each
+# block: rows written through SilverStripe are read back out with psql.
 set -uo pipefail
 
 cd "$(dirname "${BASH_SOURCE[0]}")/../.."
 
-SCHEMA="${SS_DATABASE_NAME:-silverstripe}"
-
 failures=0
 check() { # name expected actual
-    if [[ "$3" == *"$2"* ]]; then printf 'ok   %s\n' "$1"
-    else printf 'FAIL %s\n     expected to contain: %s\n     got: %s\n' "$1" "$2" "$3"; failures=$((failures+1)); fi
+    if [[ "$3" == *"$2"* ]]; then printf '  ok   %s\n' "$1"
+    else printf '  FAIL %s\n       expected to contain: %s\n       got: %s\n' "$1" "$2" "$3"; failures=$((failures+1)); fi
 }
-ss() { docker compose --profile silverstripe run --rm -T -e SS_SKIP_DEV_BUILD=1 silverstripe "$@" 2>&1; }
-# Queries are schema-qualified rather than relying on search_path, so a missing
-# schema shows up as a clear failure instead of silently reading public.
 pg() { docker compose exec -T postgres psql -U postgres -d app -tAc "$1" 2>&1; }
 
-echo "== resetting the example schema =="
-docker compose exec -T postgres psql -U postgres -d app -q \
-    -c "DROP SCHEMA IF EXISTS $SCHEMA CASCADE" >/dev/null 2>&1
+run_connector() { # label db_class connector_name schema
+    local label="$1" db_class="$2" connector="$3" schema="$4"
+    local ss=(docker compose --profile silverstripe run --rm -T
+              -e SS_SKIP_DEV_BUILD=1 -e "SS_DATABASE_NAME=$schema" -e "SS_DATABASE_CLASS=$db_class"
+              silverstripe)
 
-echo
-echo "== schema build =="
-build_out="$(ss vendor/bin/sake dev/build flush=1)"
-check "dev/build completes"                   "Database build completed" "$build_out"
-check "dev/build creates the CMS tables"      "Table SiteTree: created"  "$build_out"
-check "dev/build creates the example table"   "Table ProofRecord: created" "$build_out"
+    printf '\n=== %s (%s -> schema %s) ===\n' "$label" "$db_class" "$schema"
+    docker compose exec -T postgres psql -U postgres -d app -q \
+        -c "DROP SCHEMA IF EXISTS $schema CASCADE" >/dev/null 2>&1
 
-echo
-echo "== the driver really is MariaDB over PDO =="
-driver_out="$(ss vendor/bin/sake dev/tasks/mysql2pg-driver-report flush=1)"
-check "connector is PDO"                      "connector=PDOConnector" "$driver_out"
-check "server reports as MariaDB"             "MariaDB"                "$driver_out"
-check "ANSI quoting is in effect"             "ansi=yes"               "$driver_out"
+    local out
+    out="$("${ss[@]}" vendor/bin/sake dev/build flush=1 2>&1)"
+    check "dev/build completes"                 "Database build completed"   "$out"
+    check "CMS tables created"                  "Table SiteTree: created"    "$out"
+    check "example table created"               "Table ProofRecord: created" "$out"
 
-echo
-echo "== ORM write / read / aggregate =="
-proof_out="$(ss vendor/bin/sake dev/tasks/mysql2pg-proof flush=1)"
-check "ORM round-trip"                        "total=3 active=2" "$proof_out"
-check "aggregate SUM"                         "sum_qty=20"       "$proof_out"
-check "aggregate MAX"                         "max_price=101.25" "$proof_out"
-check "ORDER BY picks the right row"          "top=Gadget"       "$proof_out"
-check "partial-match filter"                  "partial=Gadget"   "$proof_out"
-check "UPDATE is visible on re-read"          "updated=99"       "$proof_out"
+    out="$("${ss[@]}" vendor/bin/sake dev/tasks/mysql2pg-driver-report flush=1 2>&1)"
+    check "connector is $connector"             "connector=$connector"       "$out"
+    check "server reports as MariaDB"           "MariaDB"                    "$out"
+    check "ANSI quoting is in effect"           "ansi=yes"                   "$out"
 
-echo
-echo "== the data is genuinely in PostgreSQL =="
-check "CMS tables exist in PostgreSQL"        "SiteTree" \
-      "$(pg "SELECT tablename FROM pg_tables WHERE schemaname = '$SCHEMA' AND tablename = 'SiteTree'")"
-check "row count matches"                     "3"      "$(pg "SELECT count(*) FROM $SCHEMA.\"ProofRecord\"")"
-check "updated value persisted"               "99"     "$(pg "SELECT \"Quantity\" FROM $SCHEMA.\"ProofRecord\" WHERE \"Title\" = 'Gadget'")"
-check "decimal survived the round trip"       "101.25" "$(pg "SELECT \"Price\" FROM $SCHEMA.\"ProofRecord\" WHERE \"Title\" = 'Doohickey'")"
-check "the default home page was written"     "1"      "$(pg "SELECT count(*) FROM $SCHEMA.\"SiteTree\" WHERE \"URLSegment\" = 'home'")"
+    out="$("${ss[@]}" vendor/bin/sake dev/tasks/mysql2pg-proof flush=1 2>&1)"
+    check "ORM round-trip"                      "total=3 active=2"  "$out"
+    check "aggregate SUM"                       "sum_qty=20"        "$out"
+    check "aggregate MAX"                       "max_price=101.25"  "$out"
+    check "ORDER BY picks the right row"        "top=Gadget"        "$out"
+    check "partial-match filter"                "partial=Gadget"    "$out"
+    check "UPDATE is visible on re-read"        "updated=99"        "$out"
+
+    check "CMS tables exist in PostgreSQL"      "SiteTree" \
+          "$(pg "SELECT tablename FROM pg_tables WHERE schemaname = '$schema' AND tablename = 'SiteTree'")"
+    check "row count matches"                   "3" \
+          "$(pg "SELECT count(*) FROM $schema.\"ProofRecord\"")"
+    check "updated value persisted"             "99" \
+          "$(pg "SELECT \"Quantity\" FROM $schema.\"ProofRecord\" WHERE \"Title\" = 'Gadget'")"
+    check "decimal survived the round trip"     "101.25" \
+          "$(pg "SELECT \"Price\" FROM $schema.\"ProofRecord\" WHERE \"Title\" = 'Doohickey'")"
+    check "the default home page was written"   "1" \
+          "$(pg "SELECT count(*) FROM $schema.\"SiteTree\" WHERE \"URLSegment\" = 'home'")"
+}
+
+run_mysqli_protocol_probe() {
+    printf '\n=== raw mysqli protocol (schema mysqli_probe) ===\n'
+    docker compose exec -T postgres psql -U postgres -d app -q \
+        -c "DROP SCHEMA IF EXISTS mysqli_probe CASCADE" >/dev/null 2>&1
+    local out
+    out="$(docker compose --profile silverstripe run --rm -T -e SS_SKIP_DEV_BUILD=1 \
+              -e MW_DB=mysqli_probe silverstripe php /usr/local/bin/mysqli-probe.php 2>&1)"
+    echo "$out" | grep -E "^  (ok|FAIL|connected)" || true
+    if grep -q "FAIL" <<<"$out"; then
+        failures=$((failures + $(grep -c "FAIL" <<<"$out")))
+    fi
+}
+
+case "${1:-both}" in
+    pdo)    run_connector "PDO"    MySQLPDODatabase PDOConnector    ss_pdo ;;
+    mysqli) run_connector "mysqli" MySQLDatabase    MySQLiConnector ss_mysqli ;;
+    probe)  run_mysqli_protocol_probe ;;
+    both)
+        run_connector "PDO"    MySQLPDODatabase PDOConnector    ss_pdo
+        run_connector "mysqli" MySQLDatabase    MySQLiConnector ss_mysqli
+        run_mysqli_protocol_probe
+        ;;
+    *) echo "usage: $0 [pdo|mysqli|probe|both]" >&2; exit 2 ;;
+esac
 
 echo
 if (( failures )); then echo "$failures check(s) failed"; exit 1; fi

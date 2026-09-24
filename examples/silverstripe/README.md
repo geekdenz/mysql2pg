@@ -6,8 +6,14 @@ same binary carrying a completely unrelated one, with a different ORM, a
 different dialect habit, and no shared code.
 
 Nothing in the container knows PostgreSQL exists. SilverStripe is configured
-with its own stock MariaDB driver over PDO and talks the MySQL wire protocol;
-the middleware translates, and PostgreSQL stores.
+with its own stock MariaDB driver and talks the MySQL wire protocol; the
+middleware translates, and PostgreSQL stores.
+
+Both of PHP's MySQL client libraries are covered, because they use the wire
+protocol differently: **PDO** (`pdo_mysql`) and **mysqli**. With prepared
+statements unemulated, PDO leans on the binary protocol, while mysqli's
+`query()` uses the text protocol and its `bind_result()` path depends on the
+column metadata returned at prepare time.
 
 ```
 SilverStripe ──PDO / MySQL wire──▶ mysql2pg-middleware ──libpq──▶ PostgreSQL
@@ -18,17 +24,29 @@ SilverStripe ──PDO / MySQL wire──▶ mysql2pg-middleware ──libpq─�
 
 ```bash
 docker compose --profile silverstripe up -d --build
-./examples/silverstripe/smoke.sh
+./examples/silverstripe/smoke.sh              # both connectors + raw protocol probe
+./examples/silverstripe/smoke.sh mysqli       # or: pdo | mysqli | probe
 ```
 
-The CMS is then on <http://localhost:8082> (admin / password by default).
+The CMS is then on <http://localhost:8082> (admin / password by default). Set
+`SS_DATABASE_CLASS=MySQLDatabase` to run the site itself on mysqli instead of
+PDO.
+
+Each connector builds into its own PostgreSQL schema (`ss_pdo`, `ss_mysqli`),
+dropped at the start of every run, so the two are verified independently.
+
+`mysqli-probe.php` additionally talks to the middleware with raw mysqli, no ORM
+in the way, so a protocol regression is attributed clearly rather than showing
+up as a puzzling ORM failure.
 
 ## Why these version pins
 
 **SilverStripe 4.13, not 5.** SilverStripe 5 removed the PDO connector and
-supports only `mysqli`. Since the point here is to exercise a *PDO* client,
-this example pins the last release line that ships `MySQLPDODatabase`. That
-also fixes PHP at 8.1, which is what 4.13 supports.
+supports only `mysqli`. 4.13 is the last line that ships *both*, which is what
+makes the two-connector comparison above possible from a single image: the
+application, its version and its schema are identical, so any difference is
+attributable to the client library alone. That also fixes PHP at 8.1, which is
+what 4.13 supports.
 
 ## What it actually proves
 

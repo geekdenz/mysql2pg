@@ -126,7 +126,8 @@ persistent settings, first installation and backup behavior.
 To back up and reset an incomplete Matomo installation, run `./reset-matomo.sh`.
 
 A second, unrelated application is carried end to end as a compatibility proof:
-SilverStripe CMS on its stock MariaDB/PDO driver. See
+SilverStripe CMS on its stock MariaDB driver, over both of PHP's MySQL client
+libraries (PDO and mysqli). See
 [examples/silverstripe](examples/silverstripe/README.md).
 
 ```bash

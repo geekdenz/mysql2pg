@@ -115,10 +115,27 @@ Two applications are carried end to end, plus a synthetic suite:
 |---|---|
 | `tests/generic-app-smoke.sh` | a plain inventory schema over the MySQL protocol, no application involved |
 | Matomo | see [matomo.md](matomo.md) — tracking and report archiving |
-| `examples/silverstripe/` | SilverStripe CMS on its MariaDB/PDO driver; `smoke.sh` builds the schema, drives the ORM, then reads the rows back with `psql` |
+| `examples/silverstripe/` | SilverStripe CMS on its MariaDB driver over **both PDO and mysqli**; `smoke.sh` builds the schema, drives the ORM, then reads the rows back with `psql` |
+| `examples/silverstripe/mysqli-probe.php` | raw mysqli against the middleware — text and binary protocol, `bind_result`, `store_result`, prepared `SHOW` |
 
 SilverStripe is a deliberately different shape from Matomo: a different ORM, a
 different quoting convention (`ANSI_QUOTES`), and heavy schema introspection.
+
+### Client libraries
+
+Both PHP MySQL clients are supported and tested, and they exercise the wire
+protocol differently:
+
+- **PDO** (`pdo_mysql`) with emulation off prepares nearly everything, so most
+  statements arrive over the binary protocol.
+- **mysqli** sends `query()` over the text protocol, and its `bind_result()`
+  path depends on the column metadata the server returns at *prepare* time —
+  so the column count and labels have to be right before any row is fetched.
+
+Prepared `SHOW` statements matter here: clients such as Zend's mysqli adapter
+prepare `SHOW VARIABLES LIKE ?`, `SHOW TABLES LIKE ?` and
+`SHOW TABLE STATUS LIKE ?` with a bound parameter rather than inlining it, so
+those forms accept a placeholder as well as a literal.
 
 ### Schema introspection
 
