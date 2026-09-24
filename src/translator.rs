@@ -866,7 +866,9 @@ fn translate_show_table_status_direct(
     sql: &str,
 ) -> Result<Option<(String, Vec<String>)>, MiddlewareError> {
     let pattern = Regex::new(
-        r#"(?is)^\s*SHOW\s+TABLE\s+STATUS(?:\s+(?:FROM|IN)\s+(?:`([^`]+)`|"([^"]+)"|([A-Za-z_][A-Za-z0-9_$]*)))?(?:\s+LIKE\s+'([^']*)')?\s*;?\s*$"#,
+        // The LIKE pattern may be a literal or a `?` placeholder, because
+        // clients such as Zend's mysqli adapter prepare this statement.
+        r#"(?is)^\s*SHOW\s+TABLE\s+STATUS(?:\s+(?:FROM|IN)\s+(?:`([^`]+)`|"([^"]+)"|([A-Za-z_][A-Za-z0-9_$]*)))?(?:\s+LIKE\s+(?:'([^']*)'|(\?)))?\s*;?\s*$"#,
     )
     .expect("valid SHOW TABLE STATUS regex");
     let Some(caps) = pattern.captures(sql) else {
@@ -909,6 +911,8 @@ fn translate_show_table_status_direct(
             " AND c.relname LIKE {}",
             sql_string_literal(like.as_str())
         ));
+    } else if caps.get(5).is_some() {
+        translated.push_str(" AND c.relname LIKE $1");
     }
 
     translated.push_str(" ORDER BY c.relname");

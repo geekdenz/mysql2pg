@@ -594,3 +594,12 @@ fn show_indexes_accepts_ansi_quoted_table_names() {
     assert!(result.translated_sql.contains("Key_name"));
     assert!(result.translated_sql.contains("ProofRecord"));
 }
+
+#[test]
+fn show_table_status_accepts_a_placeholder_pattern() {
+    // Zend's mysqli adapter prepares this rather than inlining the pattern.
+    let result = translate_sql("SHOW TABLE STATUS LIKE ?", &TranslatorConfig::default()).unwrap();
+
+    assert!(result.translated_sql.contains("pg_class"));
+    assert!(result.translated_sql.contains("c.relname LIKE $1"));
+}
