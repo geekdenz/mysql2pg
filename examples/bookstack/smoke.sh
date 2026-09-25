@@ -29,30 +29,34 @@ docker compose exec -T postgres psql -U postgres -d app -q \
 echo
 echo "=== migrations ==="
 out="$(bs php artisan migrate --force --no-interaction)"
-check "migrations run to completion"  "DONE"          "$out"
-check "the entity tables are created" "create_books"  "$out"
+check "migrations run to completion"  "DONE"               "$out"
+check "no migration failed"           ""                   "${out/FAIL/}"
+check "the entity table is created"   "create_entities_table" "$out"
 
 echo
 echo "=== Eloquent write / read / aggregate ==="
 out="$(bs php artisan mysql2pg:proof)"
-check "entities created"              "pages=3"           "$out"
+check "rows created"                  "pages=3"           "$out"
 check "aggregate SUM"                 "sum_priority=60"   "$out"
 check "aggregate MAX"                 "max_priority=30"   "$out"
 check "ORDER BY picks the right row"  "top=mysql2pg page three" "$out"
 check "LIKE filter"                   "partial=mysql2pg page two" "$out"
 check "UPDATE visible on re-read"     "updated=99"        "$out"
 check "JOIN + GROUP BY"               "grouped=mysql2pg book/3"   "$out"
+check "correlated subquery"           "subquery=3"        "$out"
 
 echo
 echo "=== the data is genuinely in PostgreSQL ==="
-check "tables exist in PostgreSQL"    "pages" \
-      "$(pg "SELECT tablename FROM pg_tables WHERE schemaname = '$SCHEMA' AND tablename = 'pages'")"
+check "tables exist in PostgreSQL"    "entities" \
+      "$(pg "SELECT tablename FROM pg_tables WHERE schemaname = '$SCHEMA' AND tablename = 'entities'")"
 check "page count matches"            "3" \
-      "$(pg "SELECT count(*) FROM $SCHEMA.pages WHERE name LIKE 'mysql2pg%'")"
+      "$(pg "SELECT count(*) FROM $SCHEMA.entities WHERE type = 'page' AND name LIKE 'mysql2pg%'")"
 check "updated value persisted"       "99" \
-      "$(pg "SELECT priority FROM $SCHEMA.pages WHERE name = 'mysql2pg page three'")"
+      "$(pg "SELECT priority FROM $SCHEMA.entities WHERE name = 'mysql2pg page three'")"
 check "the book row is there"         "mysql2pg-book" \
-      "$(pg "SELECT slug FROM $SCHEMA.books WHERE slug = 'mysql2pg-book'")"
+      "$(pg "SELECT slug FROM $SCHEMA.entities WHERE slug = 'mysql2pg-book'")"
+check "the role table was populated"  "1" \
+      "$(pg "SELECT count(*) FROM $SCHEMA.roles WHERE system_name = 'admin'")"
 
 echo
 if (( failures )); then echo "$failures check(s) failed"; exit 1; fi

@@ -3139,6 +3139,14 @@ fn translate_alter_table(
                     warnings,
                 )?);
             }
+            AlterTableOperation::DropForeignKey { name, .. } => {
+                // MySQL names the constraint; PostgreSQL drops it as a constraint
+                // rather than with a FOREIGN KEY keyword.
+                operations.push(format!("DROP CONSTRAINT {}", quote_ident_name(name)));
+                warnings.push(
+                    "rewrote MySQL DROP FOREIGN KEY to PostgreSQL DROP CONSTRAINT".to_string(),
+                );
+            }
             AlterTableOperation::DropPrimaryKey { .. } => {
                 // PostgreSQL drops a primary key by constraint name, which MySQL
                 // does not mention. PostgreSQL names one `<table>_pkey` unless it
@@ -3396,22 +3404,124 @@ const INFORMATION_SCHEMA_STATISTICS_VIEW: &str = "( \
     JOIN pg_am am ON am.oid = i.relam \
     JOIN LATERAL unnest(ix.indkey) WITH ORDINALITY AS k(attnum, ordinality) ON TRUE \
     JOIN pg_attribute a ON a.attrelid = t.oid AND a.attnum = k.attnum \
-) AS statistics";
+)";
+
+/// MySQL's extra `information_schema.columns` columns, added to PostgreSQL's.
+///
+/// PostgreSQL implements the standard columns but not MySQL's additions, and
+/// clients read them to reconstruct a column's declared type: `column_type`
+/// (`varchar(191)` where the standard `data_type` says `character varying`),
+/// `extra` (`auto_increment`), `column_comment` and `column_key`. Everything
+/// PostgreSQL already provides is passed through with `c.*`, so queries that
+/// only use the standard columns are unaffected.
+const INFORMATION_SCHEMA_COLUMNS_VIEW: &str = "( \
+    SELECT c.*, \
+           CASE \
+               WHEN c.data_type = 'integer' THEN 'int(11)' \
+               WHEN c.data_type = 'smallint' THEN 'smallint(6)' \
+               WHEN c.data_type = 'bigint' THEN 'bigint(20)' \
+               WHEN c.data_type = 'boolean' THEN 'tinyint(1)' \
+               WHEN c.data_type = 'text' THEN 'mediumtext' \
+               WHEN c.data_type = 'double precision' THEN 'double' \
+               WHEN c.data_type = 'real' THEN 'float' \
+               WHEN c.data_type = 'bytea' THEN 'blob' \
+               WHEN c.data_type = 'character varying' AND c.character_maximum_length IS NOT NULL \
+                   THEN 'varchar(' || c.character_maximum_length || ')' \
+               WHEN c.data_type = 'character varying' THEN 'varchar(255)' \
+               WHEN c.data_type = 'character' AND c.character_maximum_length IS NOT NULL \
+                   THEN 'char(' || c.character_maximum_length || ')' \
+               WHEN c.data_type = 'numeric' AND c.numeric_precision IS NOT NULL \
+                   THEN 'decimal(' || c.numeric_precision || ',' || COALESCE(c.numeric_scale, 0) || ')' \
+               WHEN c.data_type LIKE 'timestamp%' THEN 'datetime' \
+               WHEN c.data_type LIKE 'time%' THEN 'time' \
+               ELSE c.data_type \
+           END AS column_type, \
+           CASE \
+               WHEN c.is_identity = 'YES' THEN 'auto_increment' \
+               WHEN c.column_default LIKE 'nextval(%' THEN 'auto_increment' \
+               ELSE '' \
+           END AS extra, \
+           '' AS column_comment, \
+           '' AS column_key, \
+           '' AS privileges \
+    FROM information_schema.columns c \
+)";
+
+/// Decide whether the text following a rewritten table reference is an alias.
+///
+/// The Rust regex crate has no lookahead, so the trailing word is captured and
+/// checked here: `FROM information_schema.columns WHERE ...` must not treat
+/// WHERE as an alias. Returns (alias, text to re-emit after it).
+fn derived_table_alias<'a>(captured: Option<&'a str>, default: &str) -> (String, &'a str) {
+    const KEYWORDS: &[&str] = &[
+        "WHERE", "GROUP", "ORDER", "HAVING", "LIMIT", "OFFSET", "FETCH", "UNION", "INTERSECT",
+        "EXCEPT", "JOIN", "INNER", "LEFT", "RIGHT", "FULL", "CROSS", "NATURAL", "ON", "USING",
+        "WINDOW", "FOR", "AND", "OR", "SET", "RETURNING", "LATERAL",
+    ];
+
+    let Some(raw) = captured else {
+        return (default.to_string(), "");
+    };
+    let trimmed = raw.trim();
+    let candidate = trimmed
+        .strip_prefix("AS ")
+        .or_else(|| trimmed.strip_prefix("as "))
+        .unwrap_or(trimmed)
+        .trim()
+        .trim_matches('`')
+        .trim_matches('"');
+
+    if candidate.is_empty() || KEYWORDS.contains(&candidate.to_ascii_uppercase().as_str()) {
+        // Not an alias: keep the captured text where it was.
+        (default.to_string(), raw)
+    } else {
+        (candidate.to_string(), "")
+    }
+}
 
 /// Replace references to MySQL-only information_schema views with equivalents
 /// built from the PostgreSQL catalog.
 fn rewrite_mysql_information_schema_views(sql: &str, warnings: &mut Vec<String>) -> String {
-    // Applied after translation, so the identifier may already be quoted.
-    let re = Regex::new(r#"(?i)[`"]?information_schema[`"]?\s*\.\s*[`"]?statistics[`"]?"#)
-        .expect("valid information_schema.statistics regex");
-    if !re.is_match(sql) {
-        return sql.to_string();
+    // Applied after translation, so the identifier may already be quoted. Any
+    // alias that follows is preserved, since a derived table needs exactly one.
+    let statistics = Regex::new(
+        r#"(?i)[`"]?information_schema[`"]?\s*\.\s*[`"]?statistics[`"]?(\s+(?:AS\s+)?[`"]?[A-Za-z_][A-Za-z0-9_$]*[`"]?)?"#,
+    )
+    .expect("valid information_schema.statistics regex");
+    let columns = Regex::new(
+        r#"(?i)[`"]?information_schema[`"]?\s*\.\s*[`"]?columns[`"]?(\s+(?:AS\s+)?[`"]?[A-Za-z_][A-Za-z0-9_$]*[`"]?)?"#,
+    )
+    .expect("valid information_schema.columns regex");
+
+    let mut out = sql.to_string();
+
+    if statistics.is_match(&out) {
+        warnings.push(
+            "rewrote MySQL information_schema.statistics to a PostgreSQL catalog query".to_string(),
+        );
+        out = statistics
+            .replace_all(&out, |caps: &Captures| {
+                let (alias, rest) = derived_table_alias(caps.get(1).map(|m| m.as_str()), "statistics");
+                format!("{INFORMATION_SCHEMA_STATISTICS_VIEW} AS {alias}{rest}")
+            })
+            .to_string();
     }
-    warnings.push(
-        "rewrote MySQL information_schema.statistics to a PostgreSQL catalog query".to_string(),
-    );
-    re.replace_all(sql, INFORMATION_SCHEMA_STATISTICS_VIEW)
-        .to_string()
+
+    // Skip the view's own FROM clause, or the rewrite would recurse.
+    if columns.is_match(&out) && !out.contains("AS column_type") {
+        warnings.push(
+            "extended information_schema.columns with MySQL's column_type/extra columns"
+                .to_string(),
+        );
+        out = columns
+            .replace_all(&out, |caps: &Captures| {
+                let (alias, rest) = derived_table_alias(caps.get(1).map(|m| m.as_str()), "columns");
+                format!("{INFORMATION_SCHEMA_COLUMNS_VIEW} AS {alias}{rest}")
+            })
+            .to_string();
+    }
+
+    out
 }
 
 /// Split a GROUP_CONCAT argument on its SEPARATOR clause.

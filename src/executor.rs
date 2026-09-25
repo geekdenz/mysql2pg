@@ -1,3 +1,4 @@
+use std::{collections::HashMap, sync::{atomic::{AtomicBool, Ordering}, OnceLock}};
 use async_trait::async_trait;
 use serde::Serialize;
 use bytes::BytesMut;
@@ -416,13 +417,73 @@ impl PostgresExecutor for TokioPostgresExecutor {
 pub struct SessionPostgresExecutor {
     connection_string: String,
     client: Mutex<Option<tokio_postgres::Client>>,
+    /// Whether the client has an open transaction.
+    ///
+    /// Tracked locally rather than asked of PostgreSQL, which would cost a
+    /// round trip on every statement. It decides whether a failed statement
+    /// can simply be retried (outside a transaction) or has to be rolled back
+    /// to a savepoint first, because a failure inside a transaction aborts it
+    /// and every later statement - including the repair's catalog lookup -
+    /// fails with 25P02 until it is unwound.
+    in_transaction: AtomicBool,
 }
+
+/// Does this statement open or close a transaction?
+fn transaction_state_change(sql: &str) -> Option<bool> {
+    let upper = sql.trim_start().to_ascii_uppercase();
+    if upper.starts_with("BEGIN") || upper.starts_with("START TRANSACTION") {
+        return Some(true);
+    }
+    if upper.starts_with("COMMIT") || upper.starts_with("ROLLBACK") || upper.starts_with("END") {
+        return Some(false);
+    }
+    None
+}
+
+const REPAIR_SAVEPOINT: &str = "mysql2pg_repair";
 
 impl SessionPostgresExecutor {
     pub fn new(connection_string: String) -> Self {
         Self {
             connection_string,
             client: Mutex::new(None),
+            in_transaction: AtomicBool::new(false),
+        }
+    }
+
+    fn note_transaction_statement(&self, sql: &str) {
+        if let Some(open) = transaction_state_change(sql) {
+            self.in_transaction.store(open, Ordering::Relaxed);
+        }
+    }
+
+    /// Open a savepoint so a failed statement can be retried.
+    ///
+    /// Outside a transaction there is nothing to protect: a failure leaves the
+    /// connection usable, so the repair can retry directly.
+    async fn begin_repair_savepoint(&self, client: &tokio_postgres::Client) -> bool {
+        if !self.in_transaction.load(Ordering::Relaxed) {
+            return false;
+        }
+        client
+            .batch_execute(&format!("SAVEPOINT {REPAIR_SAVEPOINT}"))
+            .await
+            .is_ok()
+    }
+
+    async fn rollback_repair_savepoint(client: &tokio_postgres::Client, active: bool) {
+        if active {
+            let _ = client
+                .batch_execute(&format!("ROLLBACK TO SAVEPOINT {REPAIR_SAVEPOINT}"))
+                .await;
+        }
+    }
+
+    async fn release_repair_savepoint(client: &tokio_postgres::Client, active: bool) {
+        if active {
+            let _ = client
+                .batch_execute(&format!("RELEASE SAVEPOINT {REPAIR_SAVEPOINT}"))
+                .await;
         }
     }
 
@@ -459,6 +520,7 @@ impl PostgresExecutor for SessionPostgresExecutor {
         schema: Option<&str>,
         sql: &str,
     ) -> Result<QueryResult, MiddlewareError> {
+        self.note_transaction_statement(sql);
         let guard = self.acquire().await?;
         let client = guard.as_ref().unwrap();
         Self::set_schema(client, schema).await?;
@@ -588,15 +650,28 @@ impl PostgresExecutor for SessionPostgresExecutor {
         // repair needs the failure to know which column or key is at fault.
         let mut statement_sql = sql.to_string();
         for _ in 0..MAX_COMPAT_REPAIR_ATTEMPTS {
+            let savepoint = self.begin_repair_savepoint(client).await;
             match execute_prepared_attempt(client, &statement_sql, params).await {
-                Ok(result) => return Ok(result),
+                Ok(result) => {
+                    Self::release_repair_savepoint(client, savepoint).await;
+                    return Ok(result);
+                }
                 Err(PreparedAttemptError::Other(err)) => return Err(err),
                 Err(PreparedAttemptError::Db(err)) => {
+                    // Unwind first: inside a transaction the failure has aborted
+                    // it, and the repairs below run catalog queries.
+                    Self::rollback_repair_savepoint(client, savepoint).await;
                     if let Some(repaired) = repair_on_conflict_target(client, &statement_sql, &err).await {
                         statement_sql = repaired;
                         continue;
                     }
                     if let Some(repaired) = supply_mysql_implicit_default(client, &statement_sql, &err).await {
+                        statement_sql = repaired;
+                        continue;
+                    }
+                    if let Some(repaired) =
+                        cast_insert_source_columns(client, &statement_sql, &err).await
+                    {
                         statement_sql = repaired;
                         continue;
                     }
@@ -1292,6 +1367,10 @@ async fn simple_query_with_compat_retry(
             statement = repaired;
             continue;
         }
+        if let Some(repaired) = cast_insert_source_columns(client, &statement, &err).await {
+            statement = repaired;
+            continue;
+        }
         return Err(err);
     }
     client.simple_query(&statement).await
@@ -1413,6 +1492,202 @@ async fn execute_prepared_attempt(
 
     drop(statement);
     result
+}
+
+/// Split a SQL fragment on its top-level commas, ignoring those inside
+/// parentheses or string literals.
+fn split_top_level_commas(fragment: &str) -> Vec<(usize, usize)> {
+    let bytes = fragment.as_bytes();
+    let mut parts = Vec::new();
+    let mut depth = 0i32;
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut start = 0usize;
+    for (idx, byte) in bytes.iter().enumerate() {
+        match byte {
+            b'\'' if !in_double => in_single = !in_single,
+            b'"' if !in_single => in_double = !in_double,
+            b'(' if !in_single && !in_double => depth += 1,
+            b')' if !in_single && !in_double => depth -= 1,
+            b',' if !in_single && !in_double && depth == 0 => {
+                parts.push((start, idx));
+                start = idx + 1;
+            }
+            _ => {}
+        }
+    }
+    parts.push((start, fragment.len()));
+    parts
+}
+
+/// Find a keyword at nesting depth zero, outside string literals.
+fn find_top_level_keyword(fragment: &str, keyword: &str) -> Option<usize> {
+    let upper = fragment.to_ascii_uppercase();
+    let bytes = fragment.as_bytes();
+    let mut depth = 0i32;
+    let mut in_single = false;
+    let mut in_double = false;
+    for idx in 0..bytes.len() {
+        match bytes[idx] {
+            b'\'' if !in_double => in_single = !in_single,
+            b'"' if !in_single => in_double = !in_double,
+            b'(' if !in_single && !in_double => depth += 1,
+            b')' if !in_single && !in_double => depth -= 1,
+            _ => {}
+        }
+        if !in_single && !in_double && depth == 0 && upper[idx..].starts_with(keyword) {
+            return Some(idx);
+        }
+    }
+    None
+}
+
+/// Strip a trailing `AS alias` from a projection, returning (expression, alias).
+fn split_projection_alias(projection: &str) -> (String, String) {
+    let trimmed = projection.trim();
+    if let Some(pos) = find_top_level_keyword(trimmed, " AS ") {
+        let expr = trimmed[..pos].trim().to_string();
+        let alias = trimmed[pos..].to_string();
+        if !expr.is_empty() {
+            return (expr, alias);
+        }
+    }
+    (trimmed.to_string(), String::new())
+}
+
+/// Cast an INSERT's source columns to the types the target columns expect.
+///
+/// MySQL coerces freely between text and numeric types, so an application can
+/// legitimately feed a string into an integer column — and a client that binds
+/// every parameter as text does so on every INSERT. PostgreSQL rejects the
+/// assignment with 42804.
+///
+/// Rather than trying to find the offending expression, the whole source is
+/// wrapped in a derived table and every column cast to its target type:
+///
+///   INSERT INTO t (a, b) SELECT CAST(a AS int), CAST(b AS text) FROM ( <source> ) AS ...
+///
+/// That fixes every mismatched column in one pass and works whatever the source
+/// is — a SELECT, a UNION of them, or VALUES — which matters because the column
+/// positions of a UNION's branches cannot be rewritten independently.
+async fn cast_insert_source_columns(
+    client: &tokio_postgres::Client,
+    sql: &str,
+    err: &tokio_postgres::Error,
+) -> Option<String> {
+    const SOURCE_ALIAS: &str = "mysql2pg_source";
+
+    let db_error = err.as_db_error()?;
+    if db_error.code().code() != "42804" {
+        return None;
+    }
+
+    static MISMATCH: OnceLock<Regex> = OnceLock::new();
+    let pattern = MISMATCH.get_or_init(|| {
+        Regex::new(r#"(?i)column "([^"]+)" is of type .+ but expression is of type "#)
+            .expect("valid datatype mismatch regex")
+    });
+    if !pattern.is_match(db_error.message()) {
+        return None;
+    }
+
+    // Already wrapped: stop rather than nest wrappers forever.
+    if sql.contains(SOURCE_ALIAS) {
+        return None;
+    }
+
+    let insert_pos = find_top_level_keyword(sql, "INSERT INTO")?;
+    let after_insert = insert_pos + "INSERT INTO".len();
+    let list_open = sql[after_insert..].find('(')? + after_insert;
+    let table_ref = sql[after_insert..list_open].trim();
+    let list_close = matching_paren(sql, list_open)?;
+    let column_list = &sql[list_open + 1..list_close];
+
+    let columns = split_top_level_commas(column_list)
+        .into_iter()
+        .map(|(start, end)| column_list[start..end].trim().trim_matches('"').to_string())
+        .filter(|name| !name.is_empty())
+        .collect::<Vec<_>>();
+    if columns.is_empty() {
+        return None;
+    }
+
+    // Clauses that must stay outside the wrapper.
+    let source_region = &sql[list_close + 1..];
+    let tail_offset = ["ON CONFLICT", "RETURNING"]
+        .iter()
+        .filter_map(|keyword| find_top_level_keyword(source_region, keyword))
+        .min();
+    let (source, tail) = match tail_offset {
+        Some(offset) => (&source_region[..offset], &source_region[offset..]),
+        None => (source_region, ""),
+    };
+    let source = source.trim();
+    if source.is_empty() {
+        return None;
+    }
+
+    let types = insert_target_column_types(client, table_ref, &columns).await?;
+
+    let projection = columns
+        .iter()
+        .map(|column| match types.get(column) {
+            Some(ty) => format!("CAST({}.{} AS {})", quote_pg_ident(SOURCE_ALIAS), quote_pg_ident(column), ty),
+            None => format!("{}.{}", quote_pg_ident(SOURCE_ALIAS), quote_pg_ident(column)),
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    let alias_columns = columns
+        .iter()
+        .map(|column| quote_pg_ident(column))
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    let repaired = format!(
+        "INSERT INTO {table_ref} ({column_list}) SELECT {projection} FROM ( {source} ) AS {}({alias_columns}){}{}",
+        quote_pg_ident(SOURCE_ALIAS),
+        if tail.is_empty() { "" } else { " " },
+        tail.trim()
+    );
+
+    tracing::debug!("wrapped INSERT source in casts for {}", table_ref);
+    Some(repaired)
+}
+
+fn quote_pg_ident(name: &str) -> String {
+    format!("\"{}\"", name.replace('"', "\"\""))
+}
+
+/// Column types for the named columns of an INSERT's target table.
+async fn insert_target_column_types(
+    client: &tokio_postgres::Client,
+    table_ref: &str,
+    columns: &[String],
+) -> Option<HashMap<String, String>> {
+    let rows = client
+        .query(
+            "SELECT a.attname, pg_catalog.format_type(a.atttypid, a.atttypmod) \
+             FROM pg_attribute a \
+             WHERE a.attrelid = to_regclass($1) AND a.attnum > 0 AND NOT a.attisdropped",
+            &[&table_ref],
+        )
+        .await
+        .ok()?;
+
+    let mut types = HashMap::new();
+    for row in rows {
+        let name: String = row.try_get(0).ok()?;
+        let ty: String = row.try_get(1).ok()?;
+        if columns.iter().any(|column| column == &name) {
+            types.insert(name, ty);
+        }
+    }
+
+    if types.is_empty() {
+        None
+    } else {
+        Some(types)
+    }
 }
 
 /// Keeps a prepared-statement failure's structured PostgreSQL error so the

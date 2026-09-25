@@ -685,7 +685,7 @@ fn information_schema_statistics_is_served_from_the_catalog() {
 
     assert!(!result.translated_sql.contains("information_schema.statistics"));
     assert!(result.translated_sql.contains("pg_index"));
-    assert!(result.translated_sql.contains("AS statistics"));
+    assert!(result.translated_sql.contains(") AS statistics"));
     // A primary key is reported under MySQL's name, not PostgreSQL's.
     assert!(result.translated_sql.contains("'PRIMARY'"));
 }
@@ -733,4 +733,38 @@ fn boolean_yielding_expressions_are_integerized() {
         let result = translate_sql(sql, &TranslatorConfig::default()).unwrap();
         assert!(result.translated_sql.contains(needle), "{sql} -> {}", result.translated_sql);
     }
+}
+
+#[test]
+fn information_schema_columns_gains_mysqls_extra_columns() {
+    // Laravel reconstructs a column's declared type from column_type and extra,
+    // neither of which PostgreSQL's information_schema provides.
+    let sql = "select column_name as `name`, column_type as `type`, extra as `extra` from information_schema.columns where table_name = 'x'";
+    let result = translate_sql(sql, &TranslatorConfig::default()).unwrap();
+
+    assert!(result.translated_sql.contains("AS column_type"));
+    assert!(result.translated_sql.contains("AS extra"));
+    assert!(result.translated_sql.contains(") AS columns"));
+    // The standard columns still come through.
+    assert!(result.translated_sql.contains("c.*"));
+}
+
+#[test]
+fn information_schema_rewrites_preserve_an_existing_alias() {
+    // The middleware's own SHOW COLUMNS translation aliases the table as `c`;
+    // a derived table takes exactly one alias, so the original must be kept.
+    let sql = "SELECT c.column_name FROM information_schema.columns c WHERE c.table_name = 'x'";
+    let result = translate_sql(sql, &TranslatorConfig::default()).unwrap();
+
+    assert!(result.translated_sql.contains(") AS c"), "{}", result.translated_sql);
+    assert!(!result.translated_sql.contains("AS columns c"));
+}
+
+#[test]
+fn drop_foreign_key_becomes_drop_constraint() {
+    let result = translate_sql("ALTER TABLE `books` DROP FOREIGN KEY `books_sort_rule_id_foreign`", &TranslatorConfig::default()).unwrap();
+    assert_eq!(
+        result.translated_sql,
+        "ALTER TABLE \"books\" DROP CONSTRAINT \"books_sort_rule_id_foreign\""
+    );
 }

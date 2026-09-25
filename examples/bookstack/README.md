@@ -32,29 +32,7 @@ It builds into its own `bookstack` PostgreSQL schema, which `smoke.sh` drops at
 the start of each run, so the example is repeatable and does not disturb the
 other examples in the same database.
 
-## Status: incomplete
-
-**BookStack's migrations do not yet run to completion.** They get about 70 of
-roughly 100 migrations in, which is far enough to create the whole entity schema
-but not far enough to boot the application, so `smoke.sh` currently fails at its
-first check. The example is committed because each step of that progress came
-from a real, general middleware fix (see below), and because the remaining
-blocker is a single well-understood class of problem.
-
-**What is left: MySQL's implicit type coercion.** The migrations reach
-statements like
-
-```sql
-insert into entity_permissions (entity_id, role_id, ...) select ... , 'text' ...
-```
-
-where MySQL silently coerces a text expression into a `bigint` column and
-PostgreSQL refuses with 42804. Fixing it properly means casting the expression
-to the target column's type, which needs the column types — so it belongs in the
-executor, as a repair on 42804 alongside the existing 23502 and 42P10 repairs,
-rather than in the translator, which cannot see the catalog.
-
-## What it will prove
+## What it proves
 
 1. **Migrations run.** This is the demanding part: BookStack's migration history
    is a long series of `CREATE TABLE` and `ALTER TABLE` statements written for
@@ -68,10 +46,15 @@ rather than in the translator, which cannot see the catalog.
 
 ## Middleware gaps this found
 
-Nine, all of them general MySQL behaviour rather than BookStack quirks:
+Fifteen, all of them general MySQL behaviour rather than BookStack quirks:
 
 | gap | fix |
 |---|---|
+| transaction status flags | OK packets now report `SERVER_STATUS_IN_TRANS`; without it PDO's `inTransaction()` was always false, so `beginTransaction()` silently did nothing and `commit()` failed with "There is no active transaction" |
+| repairs inside a transaction | each repairable statement runs under a savepoint, because the first failure aborts the transaction and every later statement — including the repair's own catalog lookup — then fails with 25P02 |
+| implicit type coercion | on 42804 the INSERT's source is wrapped in a derived table and each column cast to its target type, which fixes every mismatched column at once and works for a UNION or VALUES source too |
+| `information_schema.columns` | extended with MySQL's `column_type`/`extra`, which clients read to reconstruct a declared type |
+| `DROP FOREIGN KEY` | `DROP CONSTRAINT` |
 | `schema()` / `DATABASE()` | resolve to `current_schema()`, since schemas are presented as databases |
 | booleans over the wire | render as `1`/`0`; `"false"` is truthy in PHP |
 | named constraints | `CONSTRAINT ""name""` — the ident was rendered with its backticks, then quoted again |

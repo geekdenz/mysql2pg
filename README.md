@@ -125,9 +125,10 @@ persistent settings, first installation and backup behavior.
 
 To back up and reset an incomplete Matomo installation, run `./reset-matomo.sh`.
 
-A second, unrelated application is carried end to end as a compatibility proof:
+Two further applications are carried end to end as compatibility proofs:
+BookStack (Laravel, MySQL-only) in [examples/bookstack](examples/bookstack/README.md), and
 SilverStripe CMS on its stock MariaDB driver, over both of PHP's MySQL client
-libraries (PDO and mysqli) and on both the 4.13 and 5.x release lines. See
+libraries (PDO and mysqli) and on both the 4.13 and 5.x release lines, in
 [examples/silverstripe](examples/silverstripe/README.md).
 
 ```bash

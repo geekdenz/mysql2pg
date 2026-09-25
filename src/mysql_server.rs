@@ -11,6 +11,7 @@ use std::{
 use async_trait::async_trait;
 use opensrv_mysql::{
     AsyncMysqlIntermediary, AsyncMysqlShim, Column, ColumnFlags, ColumnType, ErrorKind, InitWriter,
+    StatusFlags,
     IntermediaryOptions, OkResponse, ParamParser, QueryResultWriter, StatementMetaWriter,
     ValueInner,
 };
@@ -78,6 +79,7 @@ impl MySqlFrontendFactory {
             session_charset: "utf8mb4".to_string(),
             session_collation: "utf8mb4_general_ci".to_string(),
             session_sql_mode: "NO_AUTO_VALUE_ON_ZERO".to_string(),
+            in_transaction: false,
             transaction_isolation: "REPEATABLE-READ".to_string(),
         }
     }
@@ -180,6 +182,8 @@ struct MySqlBackend {
     session_charset: String,
     session_collation: String,
     session_sql_mode: String,
+    /// Whether a transaction is open, so OK packets can report it.
+    in_transaction: bool,
     transaction_isolation: String,
 }
 
@@ -368,6 +372,10 @@ where
             return write_canned_result(results, columns, rows).await;
         }
 
+        if let Some(open) = transaction_state_change(&original_sql) {
+            self.in_transaction = open;
+        }
+
         if postgres_sql.is_empty() {
             // SilverStripe (and others) set the mode with `SET sql_mode = ?`,
             // so the value arrives as a bound parameter rather than inline.
@@ -385,7 +393,7 @@ where
                         self.session_sql_mode = value;
                     }
                 }
-                results.completed(OkResponse::default()).await?;
+                results.completed(ok_response(self.in_transaction)).await?;
                 return Ok(());
             }
             match handle_mysql_session_query(self, &original_sql) {
@@ -401,7 +409,7 @@ where
                 }
             }
             if is_compat_noop_query(&original_sql) {
-                results.completed(OkResponse::default()).await?;
+                results.completed(ok_response(self.in_transaction)).await?;
                 return Ok(());
             }
         }
@@ -453,7 +461,7 @@ where
                         .map(|column| column.column.clone())
                         .collect();
                 }
-                write_query_result(results, query_result).await
+                write_query_result(results, query_result, self.in_transaction).await
             }
             Err(err) => {
                 tracing::warn!(
@@ -496,7 +504,7 @@ where
 
         if let Some(killed_id) = parse_kill_connection_id(trimmed) {
             kill_connection(killed_id);
-            results.completed(OkResponse::default()).await?;
+            results.completed(ok_response(self.in_transaction)).await?;
             return Ok(());
         }
 
@@ -531,7 +539,7 @@ where
                 self.executor.create_schema(&database_name).await?;
                 self.current_db = Some(database_name.clone());
                 set_default_database_name(Some(&database_name));
-                results.completed(OkResponse::default()).await?;
+                results.completed(ok_response(self.in_transaction)).await?;
                 return Ok(());
             }
             if let Some(database_name) = parse_drop_database_name(trimmed) {
@@ -540,16 +548,20 @@ where
                     self.current_db = None;
                 }
                 clear_default_database_name_if_matches(&database_name);
-                results.completed(OkResponse::default()).await?;
+                results.completed(ok_response(self.in_transaction)).await?;
                 return Ok(());
             }
-            results.completed(OkResponse::default()).await?;
+            results.completed(ok_response(self.in_transaction)).await?;
             return Ok(());
         }
 
         if let Some((columns, rows)) = canned_response_for_query(trimmed) {
             write_canned_result(results, &columns, &rows).await?;
             return Ok(());
+        }
+
+        if let Some(open) = transaction_state_change(trimmed) {
+            self.in_transaction = open;
         }
 
         let session_cfg = translator_config_for_session(&self.config.translator, &self.session_sql_mode);
@@ -573,7 +585,7 @@ where
                 if query_result.last_insert_id > 0 {
                     self.last_insert_id = query_result.last_insert_id;
                 }
-                write_query_result(results, query_result).await
+                write_query_result(results, query_result, self.in_transaction).await
             }
             Err(err) => {
                 tracing::warn!("mysql query execution failed for `{}`: {}", translated, err);
@@ -625,6 +637,7 @@ async fn execute_multi_statement_sql(
 async fn write_query_result<W>(
     results: QueryResultWriter<'_, W>,
     query_result: QueryResult,
+    in_transaction: bool,
 ) -> Result<(), MySqlServerError>
 where
     W: tokio::io::AsyncWrite + Unpin,
@@ -634,7 +647,7 @@ where
             .completed(OkResponse {
                 affected_rows: query_result.row_count,
                 last_insert_id: query_result.last_insert_id,
-                ..Default::default()
+                ..ok_response(in_transaction)
             })
             .await?;
         return Ok(());
@@ -1010,12 +1023,12 @@ fn handle_mysql_session_query(
 
     if upper.starts_with("SET NAMES ") {
         apply_set_names(backend, trimmed)?;
-        return Ok(Some(OkResponse::default()));
+        return Ok(Some(ok_response(backend.in_transaction)));
     }
 
     if is_set_sql_mode_query(&upper) {
         backend.session_sql_mode = parse_set_sql_mode_value(trimmed);
-        return Ok(Some(OkResponse::default()));
+        return Ok(Some(ok_response(backend.in_transaction)));
     }
 
     if upper.starts_with("USE ") {
@@ -1023,19 +1036,19 @@ fn handle_mysql_session_query(
             backend.current_db = Some(database_name.clone());
             set_default_database_name(Some(&database_name));
         }
-        return Ok(Some(OkResponse::default()));
+        return Ok(Some(ok_response(backend.in_transaction)));
     }
 
     if upper.starts_with("SET SESSION TRANSACTION ISOLATION LEVEL ") {
         let level = trimmed["SET SESSION TRANSACTION ISOLATION LEVEL ".len()..].trim();
         backend.transaction_isolation = normalize_transaction_isolation(level);
-        return Ok(Some(OkResponse::default()));
+        return Ok(Some(ok_response(backend.in_transaction)));
     }
 
     if upper.starts_with("SET TRANSACTION ISOLATION LEVEL ") {
         let level = trimmed["SET TRANSACTION ISOLATION LEVEL ".len()..].trim();
         backend.transaction_isolation = normalize_transaction_isolation(level);
-        return Ok(Some(OkResponse::default()));
+        return Ok(Some(ok_response(backend.in_transaction)));
     }
 
     Ok(None)
@@ -1153,6 +1166,40 @@ fn translator_config_for_session(
     let mut cfg = base.clone();
     cfg.ansi_quotes = sql_mode_enables_ansi_quotes(session_sql_mode);
     cfg
+}
+
+/// Does this statement open or close a transaction?
+///
+/// MySQL clients do not track this themselves: PDO's `inTransaction()` and its
+/// commit/rollback bookkeeping read SERVER_STATUS_IN_TRANS out of the server's
+/// OK packet. Without it, a client sees `beginTransaction()` silently fail to
+/// take effect and then reports "There is no active transaction" on commit.
+/// An OK packet carrying the session's transaction status.
+fn ok_response(in_transaction: bool) -> OkResponse {
+    let mut status_flags = StatusFlags::SERVER_STATUS_AUTOCOMMIT;
+    if in_transaction {
+        status_flags |= StatusFlags::SERVER_STATUS_IN_TRANS;
+        status_flags.remove(StatusFlags::SERVER_STATUS_AUTOCOMMIT);
+    }
+    OkResponse {
+        status_flags,
+        ..Default::default()
+    }
+}
+
+fn transaction_state_change(sql: &str) -> Option<bool> {
+    let upper = sql.trim_start().trim_end_matches(';').to_ascii_uppercase();
+    if upper.starts_with("BEGIN") || upper.starts_with("START TRANSACTION") {
+        return Some(true);
+    }
+    if upper.starts_with("COMMIT") || upper.starts_with("ROLLBACK") {
+        // Releasing or rolling back to a savepoint leaves the transaction open.
+        if upper.contains("SAVEPOINT") {
+            return None;
+        }
+        return Some(false);
+    }
+    None
 }
 
 fn is_set_sql_mode_query(upper: &str) -> bool {

@@ -117,6 +117,7 @@ Two applications are carried end to end, plus a synthetic suite:
 | Matomo | see [matomo.md](matomo.md) — tracking and report archiving |
 | `examples/silverstripe/` | SilverStripe CMS on its MariaDB driver over **both PDO and mysqli**, on **both the 4.13 and 5.x lines**; `smoke.sh` builds the schema, drives the ORM, then reads the rows back with `psql` |
 | `examples/silverstripe/mysqli-probe.php` | raw mysqli against the middleware — text and binary protocol, `bind_result`, `store_result`, prepared `SHOW` |
+| `examples/bookstack/` | BookStack (Laravel/Eloquent, MySQL-only upstream): all 104 migrations, then the query builder through write/read/aggregate/join/subquery |
 
 SilverStripe is a deliberately different shape from Matomo: a different ORM, a
 different quoting convention (`ANSI_QUOTES`), and heavy schema introspection.
@@ -155,6 +156,26 @@ collation clauses are lost. Applications that reconcile their schema on every
 startup may therefore keep trying to `ALTER` those columns. Recording the
 declared type (for example in a column comment) and replaying it would close
 this; see the limitation section in `examples/silverstripe/README.md`.
+
+### Transactions
+
+A MySQL client does not track transaction state itself: PDO's `inTransaction()`,
+and its commit and rollback bookkeeping, read `SERVER_STATUS_IN_TRANS` out of
+the server's OK packet. The middleware tracks the session's transaction state
+and reports that flag, without which `beginTransaction()` appears to do nothing
+and `commit()` fails with "There is no active transaction".
+
+The self-healing repairs run under a savepoint when a transaction is open. A
+failed statement aborts a PostgreSQL transaction, so without one the retry — and
+the catalog lookup the repair needs — would both fail with 25P02.
+
+### Implicit type coercion
+
+MySQL coerces freely between text and numeric types, and a client that binds
+every parameter as a string relies on it. PostgreSQL reports 42804 instead, so
+on that error the executor wraps the INSERT's source in a derived table and casts
+each column to its target type. That handles a `SELECT`, a `UNION` of them or
+`VALUES` alike, which matters because a UNION's branches have to agree.
 
 ### `sql_mode` awareness
 
