@@ -23,14 +23,38 @@ SilverStripe ──PDO / MySQL wire──▶ mysql2pg-middleware ──libpq─�
 ## Running it
 
 ```bash
-docker compose --profile silverstripe up -d --build
-./examples/silverstripe/smoke.sh              # both connectors + raw protocol probe
-./examples/silverstripe/smoke.sh mysqli       # or: pdo | mysqli | probe
+docker compose --profile silverstripe  up -d --build   # 4.13: PDO + mysqli
+docker compose --profile silverstripe5 up -d --build   # 5.x:  mysqli only
+
+./examples/silverstripe/smoke.sh          # 4.13 both connectors + protocol probe
+./examples/silverstripe/smoke.sh all      # the above plus SilverStripe 5
+./examples/silverstripe/smoke.sh mysqli   # one of: pdo|mysqli|probe|ss5|both|all
 ```
 
-The CMS is then on <http://localhost:8082> (admin / password by default). Set
-`SS_DATABASE_CLASS=MySQLDatabase` to run the site itself on mysqli instead of
-PDO.
+## Choosing versions
+
+Nothing is hard-pinned. The framework and PHP versions are build arguments on a
+single Dockerfile, so the example tracks whatever line you want:
+
+| profile | default | connectors | port |
+|---|---|---|---|
+| `silverstripe`  | 4.13 on PHP 8.1 | PDO **and** mysqli | 8082 |
+| `silverstripe5` | 5.4 on PHP 8.3  | mysqli only        | 8083 |
+
+Override per profile with `SILVERSTRIPE_VERSION` / `SILVERSTRIPE_PHP_VERSION`
+and `SILVERSTRIPE5_VERSION` / `SILVERSTRIPE5_PHP_VERSION`, for example:
+
+```bash
+SILVERSTRIPE5_VERSION=^5.2 SILVERSTRIPE5_PHP_VERSION=8.2 \
+  docker compose --profile silverstripe5 build silverstripe5
+```
+
+Both lines pass the same 17 checks, and SilverStripe 5 needed no middleware
+changes beyond what 4.13 already required.
+
+The CMS is then on <http://localhost:8082> (or 8083 for the 5.x profile), with
+admin / password by default. On 4.13, set `SS_DATABASE_CLASS=MySQLDatabase` to
+run the site itself on mysqli instead of PDO.
 
 Each connector builds into its own PostgreSQL schema (`ss_pdo`, `ss_mysqli`),
 dropped at the start of every run, so the two are verified independently.
@@ -39,14 +63,14 @@ dropped at the start of every run, so the two are verified independently.
 in the way, so a protocol regression is attributed clearly rather than showing
 up as a puzzling ORM failure.
 
-## Why these version pins
+## Why both lines
 
-**SilverStripe 4.13, not 5.** SilverStripe 5 removed the PDO connector and
-supports only `mysqli`. 4.13 is the last line that ships *both*, which is what
-makes the two-connector comparison above possible from a single image: the
-application, its version and its schema are identical, so any difference is
-attributable to the client library alone. That also fixes PHP at 8.1, which is
-what 4.13 supports.
+**Why 4.13 is still here alongside 5.x.** SilverStripe 5 removed the PDO
+connector, so 4.13 is the only line that ships *both*. Keeping it is what makes
+the two-connector comparison possible from one image: the application, its
+version and its schema are identical, so any difference is attributable to the
+client library alone. 5.x then shows the current release working on the same
+middleware. Neither is load-bearing for the other.
 
 ## What it actually proves
 

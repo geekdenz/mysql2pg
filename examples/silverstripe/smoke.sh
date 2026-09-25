@@ -4,7 +4,11 @@
 #
 #   docker compose --profile silverstripe up -d --build
 #   ./examples/silverstripe/smoke.sh            # both connectors
-#   ./examples/silverstripe/smoke.sh mysqli     # just one (pdo|mysqli|probe)
+#   ./examples/silverstripe/smoke.sh all        # adds SilverStripe 5
+#   ./examples/silverstripe/smoke.sh mysqli     # one of: pdo|mysqli|probe|ss5|both|all
+#
+# "ss5" drives the current SilverStripe line, which is mysqli-only, from the
+# separate silverstripe5 compose profile.
 #
 # Each connector gets its own PostgreSQL schema, dropped first, so the runs are
 # independent and repeatable. The decisive checks are the last ones in each
@@ -20,11 +24,11 @@ check() { # name expected actual
 }
 pg() { docker compose exec -T postgres psql -U postgres -d app -tAc "$1" 2>&1; }
 
-run_connector() { # label db_class connector_name schema
-    local label="$1" db_class="$2" connector="$3" schema="$4"
-    local ss=(docker compose --profile silverstripe run --rm -T
+run_connector() { # label db_class connector_name schema [service]
+    local label="$1" db_class="$2" connector="$3" schema="$4" service="${5:-silverstripe}"
+    local ss=(docker compose --profile "$service" run --rm -T
               -e SS_SKIP_DEV_BUILD=1 -e "SS_DATABASE_NAME=$schema" -e "SS_DATABASE_CLASS=$db_class"
-              silverstripe)
+              "$service")
 
     printf '\n=== %s (%s -> schema %s) ===\n' "$label" "$db_class" "$schema"
     docker compose exec -T postgres psql -U postgres -d app -q \
@@ -38,6 +42,7 @@ run_connector() { # label db_class connector_name schema
 
     out="$("${ss[@]}" vendor/bin/sake dev/tasks/mysql2pg-driver-report flush=1 2>&1)"
     check "connector is $connector"             "connector=$connector"       "$out"
+    printf '       %s\n' "$(grep -o 'DRIVER .*' <<<"$out" | head -1)"
     check "server reports as MariaDB"           "MariaDB"                    "$out"
     check "ANSI quoting is in effect"           "ansi=yes"                   "$out"
 
@@ -78,12 +83,19 @@ case "${1:-both}" in
     pdo)    run_connector "PDO"    MySQLPDODatabase PDOConnector    ss_pdo ;;
     mysqli) run_connector "mysqli" MySQLDatabase    MySQLiConnector ss_mysqli ;;
     probe)  run_mysqli_protocol_probe ;;
+    ss5)    run_connector "SilverStripe 5 (mysqli)" MySQLDatabase MySQLiConnector ss5 silverstripe5 ;;
     both)
         run_connector "PDO"    MySQLPDODatabase PDOConnector    ss_pdo
         run_connector "mysqli" MySQLDatabase    MySQLiConnector ss_mysqli
         run_mysqli_protocol_probe
         ;;
-    *) echo "usage: $0 [pdo|mysqli|probe|both]" >&2; exit 2 ;;
+    all)
+        run_connector "PDO"    MySQLPDODatabase PDOConnector    ss_pdo
+        run_connector "mysqli" MySQLDatabase    MySQLiConnector ss_mysqli
+        run_connector "SilverStripe 5 (mysqli)" MySQLDatabase MySQLiConnector ss5 silverstripe5
+        run_mysqli_protocol_probe
+        ;;
+    *) echo "usage: $0 [pdo|mysqli|probe|ss5|both|all]" >&2; exit 2 ;;
 esac
 
 echo

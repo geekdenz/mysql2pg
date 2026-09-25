@@ -115,11 +115,14 @@ Two applications are carried end to end, plus a synthetic suite:
 |---|---|
 | `tests/generic-app-smoke.sh` | a plain inventory schema over the MySQL protocol, no application involved |
 | Matomo | see [matomo.md](matomo.md) — tracking and report archiving |
-| `examples/silverstripe/` | SilverStripe CMS on its MariaDB driver over **both PDO and mysqli**; `smoke.sh` builds the schema, drives the ORM, then reads the rows back with `psql` |
+| `examples/silverstripe/` | SilverStripe CMS on its MariaDB driver over **both PDO and mysqli**, on **both the 4.13 and 5.x lines**; `smoke.sh` builds the schema, drives the ORM, then reads the rows back with `psql` |
 | `examples/silverstripe/mysqli-probe.php` | raw mysqli against the middleware — text and binary protocol, `bind_result`, `store_result`, prepared `SHOW` |
 
 SilverStripe is a deliberately different shape from Matomo: a different ORM, a
 different quoting convention (`ANSI_QUOTES`), and heavy schema introspection.
+Its framework and PHP versions are build arguments rather than pins, so the
+proof is not tied to one release: 4.13 covers both client libraries because it
+is the last line shipping PDO, and 5.x covers the current line on mysqli.
 
 ### Client libraries
 

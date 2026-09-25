@@ -127,12 +127,12 @@ To back up and reset an incomplete Matomo installation, run `./reset-matomo.sh`.
 
 A second, unrelated application is carried end to end as a compatibility proof:
 SilverStripe CMS on its stock MariaDB driver, over both of PHP's MySQL client
-libraries (PDO and mysqli). See
+libraries (PDO and mysqli) and on both the 4.13 and 5.x release lines. See
 [examples/silverstripe](examples/silverstripe/README.md).
 
 ```bash
 docker compose --profile silverstripe up -d --build
-./examples/silverstripe/smoke.sh
+./examples/silverstripe/smoke.sh        # or: all, to include SilverStripe 5
 ```
 
 ```bash
