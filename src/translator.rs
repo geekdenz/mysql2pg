@@ -8,7 +8,7 @@ use lru::LruCache;
 use regex::{Captures, Regex};
 use serde::Serialize;
 use sqlparser::ast::{
-    AlterTable, AlterTableOperation, ColumnDef, ColumnOption, CreateTable, DataType,
+    AlterTable, AlterTableOperation, AssignmentTarget, ColumnDef, ColumnOption, CreateTable, DataType,
     helpers::attached_token::AttachedToken, BinaryOperator, CaseWhen, CastKind, ExactNumberInfo, Expr, Function, FunctionArg, FunctionArgExpr, FunctionArgumentList,
     FunctionArguments, GroupByExpr, Ident, ObjectName, OnConflict, OnConflictAction, OnInsert,
     OrderByKind, Query, Select, SelectItem, SetExpr, ShowCharset, ShowCreateObject, ShowStatementFilter,
@@ -185,6 +185,8 @@ fn translate_sql_uncached(sql: &str, cfg: &TranslatorConfig) -> Result<Translati
     if requires_unsupported_rejection {
         reject_unsupported(&translated)?;
     }
+
+    let translated = rewrite_mysql_information_schema_views(&translated, &mut warnings);
 
     Ok(TranslationResult {
         original_sql,
@@ -1317,6 +1319,8 @@ fn translate_statement(stmt: &Statement, warnings: &mut Vec<String>) -> Result<S
         Statement::ShowCreate { obj_type, obj_name } => translate_show_create(obj_type, obj_name, warnings),
         Statement::ExplainTable { table_name, .. } => translate_describe_table(table_name, warnings),
         Statement::AlterTable(alter) => translate_alter_table(alter, warnings),
+        Statement::RenameTable(renames) => translate_rename_table(renames, warnings),
+        Statement::Update(_) => translate_update(stmt, warnings),
         Statement::Query(query) => translate_query(query, warnings),
         _ => Ok(stmt.to_string()),
     }
@@ -1743,6 +1747,20 @@ fn yields_boolean_in_postgres(expr: &Expr) -> bool {
         ),
         Expr::IsNull(_) | Expr::IsNotNull(_) => true,
         Expr::UnaryOp { op: UnaryOperator::Not, .. } => true,
+        // MySQL yields 1/0 for all of these; PostgreSQL yields a boolean, which
+        // it then refuses to assign to an integer column.
+        Expr::Exists { .. }
+        | Expr::InList { .. }
+        | Expr::InSubquery { .. }
+        | Expr::Like { .. }
+        | Expr::ILike { .. }
+        | Expr::Between { .. }
+        | Expr::IsDistinctFrom(_, _)
+        | Expr::IsNotDistinctFrom(_, _)
+        | Expr::IsTrue(_)
+        | Expr::IsNotTrue(_)
+        | Expr::IsFalse(_)
+        | Expr::IsNotFalse(_) => true,
         _ => false,
     }
 }
@@ -1978,6 +1996,21 @@ fn translate_insert(
             "rewrote MySQL INSERT IGNORE to PostgreSQL INSERT ... ON CONFLICT DO NOTHING"
                 .to_string(),
         );
+    }
+
+    // An INSERT ... SELECT needs the same treatment as a standalone SELECT: its
+    // source is ordinary MySQL, so relaxed GROUP BY and MySQL's 1/0 booleans can
+    // appear there too. Assigning a PostgreSQL boolean to an integer column is a
+    // hard error, so this matters more here than in a bare SELECT.
+    if let Some(source) = insert.source.as_mut() {
+        let mut fixer = RelaxedGroupByFixer { changed: false };
+        let _: ControlFlow<()> = VisitMut::visit(source.as_mut(), &mut fixer);
+        if fixer.changed {
+            warnings.push(
+                "applied MySQL SELECT compatibility rewrites to the INSERT ... SELECT source"
+                    .to_string(),
+            );
+        }
     }
 
     Ok(insert.to_string())
@@ -3068,7 +3101,18 @@ fn translate_alter_table(
                 column_position,
                 ..
             } => {
-                let (rendered_column, constraints) = translate_column(column_def, warnings)?;
+                let (mut rendered_column, constraints) = translate_column(column_def, warnings)?;
+                // MySQL backfills a new NOT NULL column with the type's implicit
+                // default ('' or 0) on an existing table; PostgreSQL rejects the
+                // statement instead. Supplying the same default reproduces MySQL's
+                // result rather than failing a migration that works upstream.
+                if let Some(default) = implicit_default_for_added_not_null_column(column_def) {
+                    rendered_column.push_str(&format!(" DEFAULT {default}"));
+                    warnings.push(format!(
+                        "added MySQL implicit default {default} to NOT NULL column `{}` so existing rows can be backfilled",
+                        column_def.name
+                    ));
+                }
                 let if_not_exists = if *if_not_exists { "IF NOT EXISTS " } else { "" };
                 operations.push(format!("ADD COLUMN {if_not_exists}{rendered_column}"));
                 for constraint in constraints {
@@ -3094,6 +3138,26 @@ fn translate_alter_table(
                     column_position.as_ref(),
                     warnings,
                 )?);
+            }
+            AlterTableOperation::DropPrimaryKey { .. } => {
+                // PostgreSQL drops a primary key by constraint name, which MySQL
+                // does not mention. PostgreSQL names one `<table>_pkey` unless it
+                // was given an explicit name, so that is what is targeted. IF
+                // EXISTS is deliberately omitted: a differently named key should
+                // fail loudly rather than silently leave the key in place.
+                let bare_table = alter
+                    .name
+                    .0
+                    .last()
+                    .map(|part| part.to_string().trim_matches('`').trim_matches('"').to_string())
+                    .unwrap_or_default();
+                operations.push(format!(
+                    "DROP CONSTRAINT {}",
+                    quote_ident(&format!("{bare_table}_pkey"))
+                ));
+                warnings.push(format!(
+                    "rewrote MySQL DROP PRIMARY KEY to DROP CONSTRAINT `{bare_table}_pkey`, PostgreSQL's default name for one"
+                ));
             }
             AlterTableOperation::DropIndex { name } => {
                 post_statements.push(format!(
@@ -3221,13 +3285,214 @@ fn translate_modify_column(
     Ok(operations)
 }
 
+
+/// MySQL's implicit default for a column added as NOT NULL without one.
+///
+/// Returns None when there is no safe equivalent - dates in particular, where
+/// MySQL's "zero date" has no PostgreSQL counterpart - so those still fail
+/// loudly rather than silently storing something different.
+fn implicit_default_for_added_not_null_column(column_def: &ColumnDef) -> Option<&'static str> {
+    let not_null = column_def
+        .options
+        .iter()
+        .any(|option| matches!(option.option, ColumnOption::NotNull));
+    if !not_null {
+        return None;
+    }
+    let has_default = column_def
+        .options
+        .iter()
+        .any(|option| matches!(option.option, ColumnOption::Default(_)));
+    if has_default {
+        return None;
+    }
+
+    // Matched on the rendered type name rather than the AST variants, which
+    // differ between sqlparser releases for the unsigned integer types.
+    let type_name = column_def.data_type.to_string().to_ascii_lowercase();
+    const STRINGY: &[&str] = &["char", "varchar", "character", "text", "tinytext", "mediumtext", "longtext", "enum", "set"];
+    const NUMERIC: &[&str] = &[
+        "tinyint", "smallint", "mediumint", "int", "integer", "bigint",
+        "float", "real", "double", "decimal", "numeric", "bit", "year",
+    ];
+    let head = type_name
+        .split(|c: char| c == '(' || c == ' ')
+        .next()
+        .unwrap_or("")
+        .to_string();
+
+    if STRINGY.contains(&head.as_str()) {
+        return Some("''");
+    }
+    if NUMERIC.contains(&head.as_str()) {
+        return Some("0");
+    }
+    if head == "blob" || head == "tinyblob" || head == "mediumblob" || head == "longblob" || head == "bytea" {
+        return Some("''::bytea");
+    }
+    None
+}
+
+/// `RENAME TABLE a TO b[, c TO d]` -> one `ALTER TABLE ... RENAME TO ...` each.
+///
+/// PostgreSQL has no RENAME TABLE statement. MySQL renames the whole list
+/// atomically; the statements below run in one implicit transaction, which is
+/// the closest equivalent.
+fn translate_rename_table(
+    renames: &[sqlparser::ast::RenameTable],
+    warnings: &mut Vec<String>,
+) -> Result<String, MiddlewareError> {
+    if renames.is_empty() {
+        return Err(MiddlewareError::Translation(
+            "RENAME TABLE requires at least one table".to_string(),
+        ));
+    }
+
+    let statements = renames
+        .iter()
+        .map(|rename| {
+            format!(
+                "ALTER TABLE {} RENAME TO {}",
+                quote_object_name(&rename.old_name),
+                // PostgreSQL takes a bare name here, not a qualified one.
+                rename
+                    .new_name
+                    .0
+                    .last()
+                    .map(|part| quote_ident(part.to_string().trim_matches('`').trim_matches('"')))
+                    .unwrap_or_else(|| quote_object_name(&rename.new_name)),
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("; ");
+
+    warnings.push("rewrote MySQL RENAME TABLE to ALTER TABLE ... RENAME TO".to_string());
+    Ok(statements)
+}
+
+/// MySQL's `information_schema.statistics` rendered from the PostgreSQL catalog.
+///
+/// PostgreSQL has no such view, and clients (Laravel's schema builder among
+/// them) read it to discover a table's indexes. The column names, and the 0/1
+/// sense of `non_unique`, follow MySQL; a primary key is reported under the name
+/// `PRIMARY`, as MySQL does, rather than PostgreSQL's `<table>_pkey`.
+const INFORMATION_SCHEMA_STATISTICS_VIEW: &str = "( \
+    SELECT n.nspname AS table_schema, \
+           t.relname AS table_name, \
+           CASE WHEN ix.indisprimary THEN 'PRIMARY' ELSE i.relname END AS index_name, \
+           a.attname AS column_name, \
+           k.ordinality AS seq_in_index, \
+           CASE WHEN am.amname = 'btree' THEN 'BTREE' ELSE upper(am.amname) END AS index_type, \
+           NOT ix.indisunique AS non_unique, \
+           CASE WHEN ix.indisunique THEN 0 ELSE 1 END AS non_unique_int, \
+           NULL::bigint AS cardinality, \
+           NULL::bigint AS sub_part, \
+           CASE WHEN a.attnotnull THEN '' ELSE 'YES' END AS nullable, \
+           'A' AS collation \
+    FROM pg_index ix \
+    JOIN pg_class t ON t.oid = ix.indrelid \
+    JOIN pg_class i ON i.oid = ix.indexrelid \
+    JOIN pg_namespace n ON n.oid = t.relnamespace \
+    JOIN pg_am am ON am.oid = i.relam \
+    JOIN LATERAL unnest(ix.indkey) WITH ORDINALITY AS k(attnum, ordinality) ON TRUE \
+    JOIN pg_attribute a ON a.attrelid = t.oid AND a.attnum = k.attnum \
+) AS statistics";
+
+/// Replace references to MySQL-only information_schema views with equivalents
+/// built from the PostgreSQL catalog.
+fn rewrite_mysql_information_schema_views(sql: &str, warnings: &mut Vec<String>) -> String {
+    // Applied after translation, so the identifier may already be quoted.
+    let re = Regex::new(r#"(?i)[`"]?information_schema[`"]?\s*\.\s*[`"]?statistics[`"]?"#)
+        .expect("valid information_schema.statistics regex");
+    if !re.is_match(sql) {
+        return sql.to_string();
+    }
+    warnings.push(
+        "rewrote MySQL information_schema.statistics to a PostgreSQL catalog query".to_string(),
+    );
+    re.replace_all(sql, INFORMATION_SCHEMA_STATISTICS_VIEW)
+        .to_string()
+}
+
+/// Split a GROUP_CONCAT argument on its SEPARATOR clause.
+fn split_group_concat_separator(inner: &str) -> Option<(String, String)> {
+    let re = Regex::new(r"(?i)\s+SEPARATOR\s+(.+)$").expect("valid separator regex");
+    let caps = re.captures(inner)?;
+    let separator = caps.get(1)?.as_str().trim().to_string();
+    let expr = inner[..caps.get(0)?.start()].trim().to_string();
+    Some((expr, separator))
+}
+
+/// Split a trailing ORDER BY off an aggregate argument, ignoring one inside
+/// parentheses or a string literal.
+fn split_off_order_by(expr: &str) -> Option<(String, String)> {
+    let upper = expr.to_ascii_uppercase();
+    let bytes = expr.as_bytes();
+    let mut depth = 0i32;
+    let mut in_string = false;
+    let mut idx = 0usize;
+    while idx < bytes.len() {
+        let ch = bytes[idx] as char;
+        match ch {
+            '\'' => in_string = !in_string,
+            '(' if !in_string => depth += 1,
+            ')' if !in_string => depth -= 1,
+            _ => {}
+        }
+        if !in_string && depth == 0 && upper[idx..].starts_with("ORDER BY") {
+            let before = expr[..idx].trim_end();
+            let after = expr[idx + "ORDER BY".len()..].trim();
+            if !before.is_empty() && !after.is_empty() {
+                return Some((before.to_string(), after.to_string()));
+            }
+        }
+        idx += 1;
+    }
+    None
+}
+
+/// Strip the table qualifier MySQL allows on an UPDATE's SET targets.
+///
+/// `UPDATE pages SET pages.n = 1` is valid MySQL; PostgreSQL rejects it with
+/// "SET target columns cannot be qualified with the relation name". Only the
+/// qualifier is dropped, so `SET a.n = b.n` keeps the qualifier on the value.
+fn translate_update(
+    stmt: &Statement,
+    warnings: &mut Vec<String>,
+) -> Result<String, MiddlewareError> {
+    let mut stmt = stmt.clone();
+    let mut stripped = Vec::new();
+
+    if let Statement::Update(update) = &mut stmt {
+        for assignment in update.assignments.iter_mut() {
+            if let AssignmentTarget::ColumnName(name) = &mut assignment.target {
+                if name.0.len() > 1 {
+                    let last = name.0.last().cloned();
+                    if let Some(last) = last {
+                        stripped.push(name.to_string());
+                        name.0 = vec![last];
+                    }
+                }
+            }
+        }
+    }
+
+    for target in stripped {
+        warnings.push(format!(
+            "dropped the table qualifier from UPDATE SET target `{target}`, which PostgreSQL does not allow"
+        ));
+    }
+
+    Ok(stmt.to_string())
+}
+
 fn translate_table_constraint(constraint: &TableConstraint) -> Result<String, MiddlewareError> {
     match constraint {
         TableConstraint::Unique(unique) => {
             let name = unique
                 .name
                 .as_ref()
-                .map(|name| format!("CONSTRAINT {} ", quote_ident(&name.to_string())))
+                .map(|name| format!("CONSTRAINT {} ", quote_ident_name(name)))
                 .unwrap_or_default();
             let columns = unique
                 .columns
@@ -3247,7 +3512,7 @@ fn translate_table_constraint(constraint: &TableConstraint) -> Result<String, Mi
             let name = primary_key
                 .name
                 .as_ref()
-                .map(|name| format!("CONSTRAINT {} ", quote_ident(&name.to_string())))
+                .map(|name| format!("CONSTRAINT {} ", quote_ident_name(name)))
                 .unwrap_or_default();
             let columns = primary_key
                 .columns
@@ -3266,7 +3531,7 @@ fn translate_table_constraint(constraint: &TableConstraint) -> Result<String, Mi
             let name = foreign_key
                 .name
                 .as_ref()
-                .map(|name| format!("CONSTRAINT {} ", quote_ident(&name.to_string())))
+                .map(|name| format!("CONSTRAINT {} ", quote_ident_name(name)))
                 .unwrap_or_default();
             let columns = foreign_key
                 .columns
@@ -3309,7 +3574,7 @@ fn translate_table_constraint(constraint: &TableConstraint) -> Result<String, Mi
             let name = check
                 .name
                 .as_ref()
-                .map(|name| format!("CONSTRAINT {} ", quote_ident(&name.to_string())))
+                .map(|name| format!("CONSTRAINT {} ", quote_ident_name(name)))
                 .unwrap_or_default();
             Ok(format!("{name}CHECK ({})", check.expr))
         }
@@ -3917,7 +4182,13 @@ fn rewrite_mysql_functions(sql: &str, warnings: &mut Vec<String>) -> String {
         // MySQL's NOW(); now() is PostgreSQL's actual callable equivalent.
         (r"(?i)\bNOW\s*\(", "now("),
         (r"(?i)\bRAND\s*\(", "RANDOM("),
-        (r"(?i)\bDATABASE\s*\(", "CURRENT_DATABASE("),
+        // The middleware presents each PostgreSQL schema as a MySQL database, and
+        // `SELECT DATABASE()` answers with the schema name, so the in-query forms
+        // have to agree. CURRENT_DATABASE() would return the PostgreSQL database
+        // instead, which never matches information_schema.*.table_schema.
+        // SCHEMA() is MySQL's synonym, used by Laravel's schema grammar.
+        (r"(?i)\bDATABASE\s*\(\s*\)", "current_schema()"),
+        (r"(?i)\bSCHEMA\s*\(\s*\)", "current_schema()"),
     ];
 
     for (pattern, replacement) in replacements {
@@ -3926,6 +4197,31 @@ fn rewrite_mysql_functions(sql: &str, warnings: &mut Vec<String>) -> String {
             warnings.push(format!("rewrote MySQL function pattern `{pattern}`"));
             out = re.replace_all(&out, replacement).to_string();
         }
+    }
+
+    // MySQL's GROUP_CONCAT(expr [ORDER BY ...] [SEPARATOR s]) -> string_agg.
+    // string_agg needs an explicit separator and a text argument, neither of
+    // which MySQL requires.
+    let (rewritten_group_concat, changed_group_concat) =
+        rewrite_function_calls(&out, "GROUP_CONCAT", |args| {
+            if args.len() != 1 {
+                return None;
+            }
+            let inner = args[0].trim();
+            let (expr, separator) = match split_group_concat_separator(inner) {
+                Some((expr, separator)) => (expr, separator),
+                None => (inner.to_string(), "','".to_string()),
+            };
+            // An ORDER BY inside the call belongs to string_agg's aggregate order.
+            let (value, order_by) = match split_off_order_by(&expr) {
+                Some((value, order_by)) => (value, format!(" ORDER BY {order_by}")),
+                None => (expr.clone(), String::new()),
+            };
+            Some(format!("string_agg(({value})::text, {separator}{order_by})"))
+        });
+    if changed_group_concat {
+        warnings.push("rewrote MySQL GROUP_CONCAT to PostgreSQL string_agg".to_string());
+        out = rewritten_group_concat;
     }
 
     let (rewritten_instr, changed_instr) = rewrite_function_calls(&out, "INSTR", |args| {
@@ -4270,7 +4566,8 @@ mod tests {
         assert!(result.translated_sql.contains("TO_TIMESTAMP(created_at)"));
         assert!(result.translated_sql.contains("EXTRACT(EPOCH FROM updated_at)"));
         assert!(result.translated_sql.contains("RANDOM()"));
-        assert!(result.translated_sql.contains("CURRENT_DATABASE()"));
+        // Schemas are presented as databases, so DATABASE() is the current schema.
+        assert!(result.translated_sql.contains("current_schema()"));
     }
 
     #[test]

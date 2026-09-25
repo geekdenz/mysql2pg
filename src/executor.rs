@@ -583,104 +583,36 @@ impl PostgresExecutor for SessionPostgresExecutor {
         let client = guard.as_ref().unwrap();
         Self::set_schema(client, schema).await?;
 
-        let statement = prepare_with_compat_retry(&client, sql)
-            .await
-            .map_err(|e| MiddlewareError::Execution(format!("statement preparation failed: {}", format_pg_error(&e))))?;
-        let bind_params = params.iter().map(|param| param as &(dyn ToSql + Sync)).collect::<Vec<_>>();
-
-        let result = if statement.columns().is_empty() {
-            if let Some((table_name, identity_column)) = find_identity_insert_target(client, sql).await? {
-                let wrapped_sql = wrap_insert_returning_sql(sql, &identity_column);
-                let wrapped_statement = client
-                    .prepare(&wrapped_sql)
-                    .await
-                    .map_err(|e| MiddlewareError::Execution(format!("statement preparation failed: {}", format_pg_error(&e))))?;
-                let row = client
-                    .query_one(&wrapped_statement, &bind_params)
-                    .await
-                    .map_err(|e| MiddlewareError::Execution(format!("statement failed: {}", format_pg_error(&e))))?;
-                let row_count = row.try_get::<usize, i64>(0).unwrap_or_default().max(0) as u64;
-                let last_insert_id = row.try_get::<usize, i64>(1).unwrap_or_default().max(0) as u64;
-                tracing::debug!(
-                    "captured insert id for {}.{} => row_count={} last_insert_id={}",
-                    table_name,
-                    identity_column,
-                    row_count,
-                    last_insert_id
-                );
-                Ok(QueryResult {
-                    columns: Vec::new(),
-                    rows: Vec::new(),
-                    row_count,
-                    last_insert_id,
-                })
-            } else if let Some((column, wrapped_sql)) = find_last_insert_id_update_target(sql) {
-                let wrapped_statement = client
-                    .prepare(&wrapped_sql)
-                    .await
-                    .map_err(|e| MiddlewareError::Execution(format!("statement preparation failed: {}", format_pg_error(&e))))?;
-                let row = client
-                    .query_one(&wrapped_statement, &bind_params)
-                    .await
-                    .map_err(|e| MiddlewareError::Execution(format!("statement failed: {}", format_pg_error(&e))))?;
-                let row_count = row.try_get::<usize, i64>(0).unwrap_or_default().max(0) as u64;
-                let last_insert_id = row.try_get::<usize, i64>(1).unwrap_or_default().max(0) as u64;
-                tracing::debug!(
-                    "captured LAST_INSERT_ID() for column {} => row_count={} last_insert_id={}",
-                    column,
-                    row_count,
-                    last_insert_id
-                );
-                Ok(QueryResult {
-                    columns: Vec::new(),
-                    rows: Vec::new(),
-                    row_count,
-                    last_insert_id,
-                })
-            } else {
-                let affected = client
-                    .execute(&statement, &bind_params)
-                    .await
-                    .map_err(|e| MiddlewareError::Execution(format!("statement failed: {}", format_pg_error(&e))))?;
-                Ok(QueryResult {
-                    columns: Vec::new(),
-                    rows: Vec::new(),
-                    row_count: affected,
-                    last_insert_id: 0,
-                })
+        // Prepared statements get the same self-healing as the simple-query path:
+        // a MySQL client can rely on behaviour PostgreSQL rejects outright, and the
+        // repair needs the failure to know which column or key is at fault.
+        let mut statement_sql = sql.to_string();
+        for _ in 0..MAX_COMPAT_REPAIR_ATTEMPTS {
+            match execute_prepared_attempt(client, &statement_sql, params).await {
+                Ok(result) => return Ok(result),
+                Err(PreparedAttemptError::Other(err)) => return Err(err),
+                Err(PreparedAttemptError::Db(err)) => {
+                    if let Some(repaired) = repair_on_conflict_target(client, &statement_sql, &err).await {
+                        statement_sql = repaired;
+                        continue;
+                    }
+                    if let Some(repaired) = supply_mysql_implicit_default(client, &statement_sql, &err).await {
+                        statement_sql = repaired;
+                        continue;
+                    }
+                    return Err(prepared_attempt_db_error(&err));
+                }
             }
-        } else {
-            let rows = client
-                .query(&statement, &bind_params)
-                .await
-                .map_err(|e| MiddlewareError::Execution(format!("query failed: {}", format_pg_error(&e))))?;
-            let columns = statement
-                .columns()
-                .iter()
-                .map(|column| column.name().to_string())
-                .collect::<Vec<_>>();
-            let rendered_rows = rows
-                .iter()
-                .map(|row| {
-                    row.columns()
-                        .iter()
-                        .enumerate()
-                        .map(|(idx, column)| value_to_string(row, idx, column.type_()))
-                        .collect::<Vec<_>>()
-                })
-                .collect::<Vec<_>>();
+        }
 
-            Ok(QueryResult {
-                row_count: rendered_rows.len() as u64,
-                columns,
-                rows: rendered_rows,
-                last_insert_id: 0,
+        execute_prepared_attempt(client, &statement_sql, params)
+            .await
+            .map_err(|err| match err {
+                PreparedAttemptError::Db(err) => prepared_attempt_db_error(&err),
+                PreparedAttemptError::Other(err) => err,
             })
-        };
-
-        drop(statement);
-        result
     }
+
 
     async fn describe_sql(&self, sql: &str) -> Result<Vec<String>, MiddlewareError> {
         self.describe_sql_in_schema(None, sql).await
@@ -988,7 +920,14 @@ fn wrap_insert_returning_sql(sql: &str, identity_column: &str) -> String {
 /// field doc on [`QueryResult`] for why that distinction matters to clients.
 fn value_to_string(row: &tokio_postgres::Row, idx: usize, ty: &Type) -> Option<FieldValue> {
     match *ty {
-        Type::BOOL => row.try_get::<usize, Option<bool>>(idx).ok().flatten().map(|v| FieldValue::from_text(v.to_string())),
+        // MySQL has no boolean type: a truth value comes back as 1 or 0. Sending
+        // PostgreSQL's "true"/"false" spelling breaks clients that cast the
+        // column, because in PHP and Perl the string "false" is truthy.
+        Type::BOOL => row
+            .try_get::<usize, Option<bool>>(idx)
+            .ok()
+            .flatten()
+            .map(|v| FieldValue::from_text(if v { "1" } else { "0" })),
         Type::INT2 => row.try_get::<usize, Option<i16>>(idx).ok().flatten().map(|v| FieldValue::from_text(v.to_string())),
         Type::INT4 => row.try_get::<usize, Option<i32>>(idx).ok().flatten().map(|v| FieldValue::from_text(v.to_string())),
         Type::INT8 => row.try_get::<usize, Option<i64>>(idx).ok().flatten().map(|v| FieldValue::from_text(v.to_string())),
@@ -1369,6 +1308,124 @@ async fn simple_query_with_compat_retry(
 /// Only string and numeric columns are handled. MySQL's implicit default for a date
 /// is `0000-00-00`, which PostgreSQL cannot represent at all, so those are left to
 /// fail rather than silently storing a different instant.
+async fn execute_prepared_attempt(
+    client: &tokio_postgres::Client,
+    sql: &str,
+    params: &[PgParam],
+) -> Result<QueryResult, PreparedAttemptError> {
+    let statement = prepare_with_compat_retry(&client, sql)
+        .await
+        .map_err(PreparedAttemptError::Db)?;
+    let bind_params = params.iter().map(|param| param as &(dyn ToSql + Sync)).collect::<Vec<_>>();
+
+    let result = if statement.columns().is_empty() {
+        if let Some((table_name, identity_column)) = find_identity_insert_target(client, sql)
+            .await
+            .map_err(PreparedAttemptError::Other)?
+        {
+            let wrapped_sql = wrap_insert_returning_sql(sql, &identity_column);
+            let wrapped_statement = client
+                .prepare(&wrapped_sql)
+                .await
+                .map_err(PreparedAttemptError::Db)?;
+            let row = client
+                .query_one(&wrapped_statement, &bind_params)
+                .await
+                .map_err(PreparedAttemptError::Db)?;
+            let row_count = row.try_get::<usize, i64>(0).unwrap_or_default().max(0) as u64;
+            let last_insert_id = row.try_get::<usize, i64>(1).unwrap_or_default().max(0) as u64;
+            tracing::debug!(
+                "captured insert id for {}.{} => row_count={} last_insert_id={}",
+                table_name,
+                identity_column,
+                row_count,
+                last_insert_id
+            );
+            Ok(QueryResult {
+                columns: Vec::new(),
+                rows: Vec::new(),
+                row_count,
+                last_insert_id,
+            })
+        } else if let Some((column, wrapped_sql)) = find_last_insert_id_update_target(sql) {
+            let wrapped_statement = client
+                .prepare(&wrapped_sql)
+                .await
+                .map_err(PreparedAttemptError::Db)?;
+            let row = client
+                .query_one(&wrapped_statement, &bind_params)
+                .await
+                .map_err(PreparedAttemptError::Db)?;
+            let row_count = row.try_get::<usize, i64>(0).unwrap_or_default().max(0) as u64;
+            let last_insert_id = row.try_get::<usize, i64>(1).unwrap_or_default().max(0) as u64;
+            tracing::debug!(
+                "captured LAST_INSERT_ID() for column {} => row_count={} last_insert_id={}",
+                column,
+                row_count,
+                last_insert_id
+            );
+            Ok(QueryResult {
+                columns: Vec::new(),
+                rows: Vec::new(),
+                row_count,
+                last_insert_id,
+            })
+        } else {
+            let affected = client
+                .execute(&statement, &bind_params)
+                .await
+                .map_err(PreparedAttemptError::Db)?;
+            Ok(QueryResult {
+                columns: Vec::new(),
+                rows: Vec::new(),
+                row_count: affected,
+                last_insert_id: 0,
+            })
+        }
+    } else {
+        let rows = client
+            .query(&statement, &bind_params)
+            .await
+            .map_err(PreparedAttemptError::Db)?;
+        let columns = statement
+            .columns()
+            .iter()
+            .map(|column| column.name().to_string())
+            .collect::<Vec<_>>();
+        let rendered_rows = rows
+            .iter()
+            .map(|row| {
+                row.columns()
+                    .iter()
+                    .enumerate()
+                    .map(|(idx, column)| value_to_string(row, idx, column.type_()))
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+
+        Ok(QueryResult {
+            row_count: rendered_rows.len() as u64,
+            columns,
+            rows: rendered_rows,
+            last_insert_id: 0,
+        })
+    };
+
+    drop(statement);
+    result
+}
+
+/// Keeps a prepared-statement failure's structured PostgreSQL error so the
+/// repair paths can read the offending table, column or constraint from it.
+enum PreparedAttemptError {
+    Db(tokio_postgres::Error),
+    Other(MiddlewareError),
+}
+
+fn prepared_attempt_db_error(err: &tokio_postgres::Error) -> MiddlewareError {
+    MiddlewareError::Execution(format!("statement failed: {}", format_pg_error(err)))
+}
+
 async fn supply_mysql_implicit_default(
     client: &tokio_postgres::Client,
     sql: &str,

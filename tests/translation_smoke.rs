@@ -603,3 +603,134 @@ fn show_table_status_accepts_a_placeholder_pattern() {
     assert!(result.translated_sql.contains("pg_class"));
     assert!(result.translated_sql.contains("c.relname LIKE $1"));
 }
+
+#[test]
+fn schema_function_resolves_to_the_current_schema() {
+    // Laravel's MySQL schema grammar probes for tables with schema().
+    let sql = "select exists (select 1 from information_schema.tables where table_schema = schema() and table_name = 'migrations') as `exists`";
+    let result = translate_sql(sql, &TranslatorConfig::default()).unwrap();
+
+    assert!(result.translated_sql.contains("current_schema()"));
+    assert!(!result.translated_sql.to_lowercase().contains("schema()  and"));
+    assert!(!result.translated_sql.contains("CURRENT_DATABASE"));
+}
+
+#[test]
+fn named_constraints_are_quoted_exactly_once() {
+    // A backticked constraint name must not end up as ""name"": rendering the
+    // Ident keeps its backticks, which the backtick pass then turns into quotes.
+    for sql in [
+        "ALTER TABLE `role_user` ADD CONSTRAINT `fk_user` FOREIGN KEY (`user_id`) REFERENCES `users` (`id`) ON DELETE CASCADE",
+        "ALTER TABLE `t` ADD CONSTRAINT `uq_t` UNIQUE (`a`)",
+        "ALTER TABLE `t` ADD CONSTRAINT `pk_t` PRIMARY KEY (`a`)",
+    ] {
+        let result = translate_sql(sql, &TranslatorConfig::default())
+            .unwrap_or_else(|e| panic!("{sql} failed: {e}"));
+        assert!(!result.translated_sql.contains("\"\""), "{sql} -> {}", result.translated_sql);
+        assert!(result.translated_sql.contains("CONSTRAINT \""), "{sql}");
+    }
+}
+
+#[test]
+fn adding_a_not_null_column_gets_mysqls_implicit_default() {
+    // MySQL backfills existing rows; PostgreSQL would reject the statement.
+    let varchar = translate_sql("ALTER TABLE `users` ADD `external_auth_id` varchar(191) NOT NULL", &TranslatorConfig::default()).unwrap();
+    assert!(varchar.translated_sql.contains("DEFAULT ''"), "{}", varchar.translated_sql);
+
+    let int = translate_sql("ALTER TABLE `users` ADD `hits` int NOT NULL", &TranslatorConfig::default()).unwrap();
+    assert!(int.translated_sql.contains("DEFAULT 0"), "{}", int.translated_sql);
+
+    // An explicit default must be left alone.
+    let explicit = translate_sql("ALTER TABLE `users` ADD `role` varchar(20) NOT NULL DEFAULT 'guest'", &TranslatorConfig::default()).unwrap();
+    assert!(explicit.translated_sql.contains("DEFAULT 'guest'"));
+    assert!(!explicit.translated_sql.contains("DEFAULT ''"));
+
+    // Nullable columns need nothing.
+    let nullable = translate_sql("ALTER TABLE `users` ADD `note` varchar(50) NULL", &TranslatorConfig::default()).unwrap();
+    assert!(!nullable.translated_sql.contains("DEFAULT"));
+
+    // Dates have no safe equivalent, so they are left to fail loudly.
+    let dated = translate_sql("ALTER TABLE `users` ADD `seen_at` datetime NOT NULL", &TranslatorConfig::default()).unwrap();
+    assert!(!dated.translated_sql.contains("DEFAULT"));
+}
+
+#[test]
+fn rename_table_becomes_alter_table_rename_to() {
+    let one = translate_sql("RENAME TABLE `permissions` TO `role_permissions`", &TranslatorConfig::default()).unwrap();
+    assert_eq!(one.translated_sql, "ALTER TABLE \"permissions\" RENAME TO \"role_permissions\"");
+
+    // MySQL allows a list; each pair becomes its own statement.
+    let many = translate_sql("RENAME TABLE `a` TO `b`, `c` TO `d`", &TranslatorConfig::default()).unwrap();
+    assert_eq!(many.translated_sql, "ALTER TABLE \"a\" RENAME TO \"b\"; ALTER TABLE \"c\" RENAME TO \"d\"");
+}
+
+#[test]
+fn group_concat_becomes_string_agg() {
+    let plain = translate_sql("SELECT GROUP_CONCAT(name) FROM t", &TranslatorConfig::default()).unwrap();
+    assert!(plain.translated_sql.contains("string_agg"), "{}", plain.translated_sql);
+    assert!(plain.translated_sql.contains("','"));
+
+    let ordered = translate_sql("SELECT GROUP_CONCAT(col ORDER BY seq) FROM t", &TranslatorConfig::default()).unwrap();
+    assert!(ordered.translated_sql.contains("ORDER BY seq"), "{}", ordered.translated_sql);
+
+    let separated = translate_sql("SELECT GROUP_CONCAT(col SEPARATOR '|') FROM t", &TranslatorConfig::default()).unwrap();
+    assert!(separated.translated_sql.contains("'|'"), "{}", separated.translated_sql);
+}
+
+#[test]
+fn information_schema_statistics_is_served_from_the_catalog() {
+    // Laravel's schema builder reads a table's indexes from this MySQL-only view.
+    let sql = "select index_name as `name` from information_schema.statistics where table_schema = schema() and table_name = 'pages'";
+    let result = translate_sql(sql, &TranslatorConfig::default()).unwrap();
+
+    assert!(!result.translated_sql.contains("information_schema.statistics"));
+    assert!(result.translated_sql.contains("pg_index"));
+    assert!(result.translated_sql.contains("AS statistics"));
+    // A primary key is reported under MySQL's name, not PostgreSQL's.
+    assert!(result.translated_sql.contains("'PRIMARY'"));
+}
+
+#[test]
+fn update_set_targets_lose_their_table_qualifier() {
+    // Valid MySQL; PostgreSQL rejects a qualified SET target.
+    let sql = "UPDATE pages SET pages.revision_count=(SELECT count(*) FROM page_revisions WHERE page_revisions.page_id=pages.id)";
+    let result = translate_sql(sql, &TranslatorConfig::default()).unwrap();
+
+    assert!(result.translated_sql.contains("SET revision_count ="), "{}", result.translated_sql);
+    // The qualifier must survive everywhere it is still legal.
+    assert!(result.translated_sql.contains("page_revisions.page_id"));
+    assert!(result.translated_sql.contains("pages.id"));
+}
+
+#[test]
+fn drop_primary_key_targets_postgres_default_constraint_name() {
+    let result = translate_sql("ALTER TABLE `joint_permissions` DROP PRIMARY KEY", &TranslatorConfig::default()).unwrap();
+    assert_eq!(
+        result.translated_sql,
+        "ALTER TABLE \"joint_permissions\" DROP CONSTRAINT \"joint_permissions_pkey\""
+    );
+    // No IF EXISTS: a differently named key must fail rather than be ignored.
+    assert!(!result.translated_sql.contains("IF EXISTS"));
+}
+
+#[test]
+fn insert_select_gets_the_select_compatibility_rewrites() {
+    // MySQL's EXISTS yields 1/0, which it will happily store in a tinyint column.
+    // PostgreSQL yields a boolean and refuses to assign it to an integer column.
+    let sql = "insert into t (a, v) select id, (select exists(select 1 from u where u.id = t.id)) as v from t";
+    let result = translate_sql(sql, &TranslatorConfig::default()).unwrap();
+    assert!(result.translated_sql.contains("CAST(EXISTS"), "{}", result.translated_sql);
+}
+
+#[test]
+fn boolean_yielding_expressions_are_integerized() {
+    for (sql, needle) in [
+        ("SELECT a LIKE 'x%' FROM t", "CAST"),
+        ("SELECT a IN (1, 2) FROM t", "CAST"),
+        ("SELECT a BETWEEN 1 AND 2 FROM t", "CAST"),
+        ("SELECT EXISTS(SELECT 1) FROM t", "CAST"),
+    ] {
+        let result = translate_sql(sql, &TranslatorConfig::default()).unwrap();
+        assert!(result.translated_sql.contains(needle), "{sql} -> {}", result.translated_sql);
+    }
+}
