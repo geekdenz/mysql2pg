@@ -127,6 +127,35 @@ services:
     volumes:
       - silverstripe5_assets:/var/www/html/public/assets
 
+  # BookStack (Laravel/Eloquent). MySQL/MariaDB only upstream, so there is no
+  # PostgreSQL code path in the application to fall back on.
+  bookstack:
+    build:
+      context: examples/bookstack
+      dockerfile: Dockerfile
+      args:
+        PHP_VERSION: ${BOOKSTACK_PHP_VERSION:-8.3}
+        BOOKSTACK_VERSION: ${BOOKSTACK_VERSION:-release}
+    profiles: ["bookstack"]
+    environment:
+      DB_CONNECTION: mysql
+      DB_HOST: ${BOOKSTACK_DB_HOST:-middleware}
+      DB_PORT: ${BOOKSTACK_DB_PORT:-3306}
+      DB_DATABASE: ${BOOKSTACK_DB_NAME:-bookstack}
+      DB_USERNAME: ${BOOKSTACK_DB_USER:-anyuser}
+      DB_PASSWORD: ${BOOKSTACK_DB_PASS:-matomo}
+      APP_URL: ${BOOKSTACK_APP_URL:-http://localhost:8084}
+      APP_ENV: production
+      APP_DEBUG: "true"
+      CACHE_DRIVER: file
+      SESSION_DRIVER: file
+      QUEUE_CONNECTION: sync
+    ports:
+      - "${BOOKSTACK_PORT:-8084}:80"
+    depends_on:
+      middleware:
+        condition: service_started
+
 volumes:
   postgres_data:
   silverstripe_assets:
