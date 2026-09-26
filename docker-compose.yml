@@ -19,6 +19,9 @@ services:
       MW_TRANSLATOR_REWRITE_MYSQL_FUNCTIONS: ${MW_TRANSLATOR_REWRITE_MYSQL_FUNCTIONS:-true}
       MW_TRANSLATOR_REWRITE_JSON_OPERATORS: ${MW_TRANSLATOR_REWRITE_JSON_OPERATORS:-true}
       MW_TRANSLATOR_STRIP_MYSQL_TABLE_OPTIONS: ${MW_TRANSLATOR_STRIP_MYSQL_TABLE_OPTIONS:-true}
+      # Applications gate features on the reported server version. Empty means
+      # the built-in MariaDB identity; Ghost needs a MySQL 8 one.
+      MW_MYSQL_SERVER_VERSION: ${MW_MYSQL_SERVER_VERSION:-}
       RUST_LOG: ${RUST_LOG:-info}
     ports:
       - "${MIDDLEWARE_PORT:-8080}:8080"
@@ -156,9 +159,51 @@ services:
       middleware:
         condition: service_started
 
+  # Ghost provisions its own schema; the middleware maps a MySQL database onto a
+  # PostgreSQL schema, so it has to exist before Ghost connects.
+  ghost-init:
+    image: postgres:17
+    profiles: ["ghost"]
+    environment:
+      PGPASSWORD: ${POSTGRES_PASSWORD:-postgres}
+    entrypoint:
+      - sh
+      - -c
+      - psql -h postgres -U ${POSTGRES_USER:-postgres} -d ${POSTGRES_DB:-app}
+        -c "CREATE SCHEMA IF NOT EXISTS ${GHOST_DB_NAME:-ghost}"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  # Ghost (Node/Knex, mysql2 driver). MySQL-only upstream - it dropped support
+  # for every other database - and a non-PHP client, so it exercises a different
+  # implementation of the wire protocol.
+  ghost:
+    image: ghost:${GHOST_VERSION:-5-alpine}
+    profiles: ["ghost"]
+    environment:
+      NODE_ENV: production
+      url: ${GHOST_URL:-http://localhost:8085}
+      database__client: mysql
+      database__connection__host: ${GHOST_DB_HOST:-middleware}
+      database__connection__port: ${GHOST_DB_PORT:-3306}
+      database__connection__user: ${GHOST_DB_USER:-anyuser}
+      database__connection__password: ${GHOST_DB_PASS:-matomo}
+      database__connection__database: ${GHOST_DB_NAME:-ghost}
+    ports:
+      - "${GHOST_PORT:-8085}:2368"
+    depends_on:
+      middleware:
+        condition: service_started
+      ghost-init:
+        condition: service_completed_successfully
+    volumes:
+      - ghost_content:/var/lib/ghost/content
+
 volumes:
   postgres_data:
   silverstripe_assets:
   silverstripe5_assets:
+  ghost_content:
   matomo_data:
     name: ${MATOMO_DATA_VOLUME:-mysql2pg-middleware_matomo_manual_install_data}

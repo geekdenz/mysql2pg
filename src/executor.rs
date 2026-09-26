@@ -49,9 +49,51 @@ impl Serialize for FieldValue {
     }
 }
 
+/// A column type as MySQL would describe it.
+///
+/// Kept deliberately coarse: enough for a client to parse a value into the right
+/// language type, without modelling every PostgreSQL type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ColumnKind {
+    Tiny,
+    Int,
+    BigInt,
+    Double,
+    Decimal,
+    DateTime,
+    Date,
+    Time,
+    Blob,
+    Text,
+}
+
+pub fn column_kind(ty: &Type) -> ColumnKind {
+    match *ty {
+        Type::BOOL => ColumnKind::Tiny,
+        Type::INT2 | Type::INT4 => ColumnKind::Int,
+        Type::INT8 => ColumnKind::BigInt,
+        Type::FLOAT4 | Type::FLOAT8 => ColumnKind::Double,
+        Type::NUMERIC => ColumnKind::Decimal,
+        Type::TIMESTAMP | Type::TIMESTAMPTZ => ColumnKind::DateTime,
+        Type::DATE => ColumnKind::Date,
+        Type::TIME => ColumnKind::Time,
+        Type::BYTEA => ColumnKind::Blob,
+        _ => ColumnKind::Text,
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct QueryResult {
     pub columns: Vec<String>,
+    /// The MySQL-shaped type of each column, where it is known.
+    ///
+    /// Reporting every column as a string is safe for PHP, where `"0"` is falsy,
+    /// but not for clients in languages where it is not: a Node client reading a
+    /// boolean column gets the string `"0"`, which is truthy in JavaScript. Empty
+    /// when the statement went out over the simple-query path, which carries no
+    /// type information.
+    #[serde(skip)]
+    pub column_kinds: Vec<ColumnKind>,
     /// `None` represents a real SQL `NULL`, distinct from an empty string. Losing
     /// this distinction over the MySQL wire protocol makes NULL-able columns arrive
     /// at the client as `""`, which breaks client code that (correctly) expects
@@ -150,6 +192,7 @@ impl PostgresExecutor for TokioPostgresExecutor {
                 );
                 Ok(QueryResult {
                     columns: vec![],
+                    column_kinds: Vec::new(),
                     rows: vec![],
                     row_count,
                     last_insert_id,
@@ -169,6 +212,7 @@ impl PostgresExecutor for TokioPostgresExecutor {
                 );
                 Ok(QueryResult {
                     columns: vec![],
+                    column_kinds: Vec::new(),
                     rows: vec![],
                     row_count,
                     last_insert_id,
@@ -186,6 +230,7 @@ impl PostgresExecutor for TokioPostgresExecutor {
                     .sum();
                 Ok(QueryResult {
                     columns: vec![],
+                    column_kinds: Vec::new(),
                     rows: vec![],
                     row_count: affected,
                     last_insert_id: 0,
@@ -206,6 +251,11 @@ impl PostgresExecutor for TokioPostgresExecutor {
                 .iter()
                 .map(|column| column.name().to_string())
                 .collect::<Vec<_>>();
+            let column_kinds = statement
+                .columns()
+                .iter()
+                .map(|column| column_kind(column.type_()))
+                .collect::<Vec<_>>();
             let rendered_rows = rows
                 .iter()
                 .map(|row| {
@@ -220,6 +270,7 @@ impl PostgresExecutor for TokioPostgresExecutor {
             Ok(QueryResult {
                 row_count: rendered_rows.len() as u64,
                 columns,
+                column_kinds,
                 rows: rendered_rows,
                 last_insert_id: 0,
             })
@@ -270,6 +321,7 @@ impl PostgresExecutor for TokioPostgresExecutor {
                 );
                 Ok(QueryResult {
                     columns: Vec::new(),
+                    column_kinds: Vec::new(),
                     rows: Vec::new(),
                     row_count,
                     last_insert_id,
@@ -293,6 +345,7 @@ impl PostgresExecutor for TokioPostgresExecutor {
                 );
                 Ok(QueryResult {
                     columns: Vec::new(),
+                    column_kinds: Vec::new(),
                     rows: Vec::new(),
                     row_count,
                     last_insert_id,
@@ -304,6 +357,7 @@ impl PostgresExecutor for TokioPostgresExecutor {
                     .map_err(|e| MiddlewareError::Execution(format!("statement failed: {}", format_pg_error(&e))))?;
                 Ok(QueryResult {
                     columns: Vec::new(),
+                    column_kinds: Vec::new(),
                     rows: Vec::new(),
                     row_count: affected,
                     last_insert_id: 0,
@@ -319,6 +373,11 @@ impl PostgresExecutor for TokioPostgresExecutor {
                 .iter()
                 .map(|column| column.name().to_string())
                 .collect::<Vec<_>>();
+            let column_kinds = statement
+                .columns()
+                .iter()
+                .map(|column| column_kind(column.type_()))
+                .collect::<Vec<_>>();
             let rendered_rows = rows
                 .iter()
                 .map(|row| {
@@ -333,6 +392,7 @@ impl PostgresExecutor for TokioPostgresExecutor {
             Ok(QueryResult {
                 row_count: rendered_rows.len() as u64,
                 columns,
+                column_kinds,
                 rows: rendered_rows,
                 last_insert_id: 0,
             })
@@ -417,6 +477,12 @@ impl PostgresExecutor for TokioPostgresExecutor {
 pub struct SessionPostgresExecutor {
     connection_string: String,
     client: Mutex<Option<tokio_postgres::Client>>,
+    /// The schema currently applied with SET search_path.
+    ///
+    /// Re-issuing it per statement costs a round trip, and worse: inside an
+    /// aborted transaction the SET itself fails with 25P02, masking the error
+    /// that aborted it and leaving the client unable to even roll back.
+    applied_schema: Mutex<Option<String>>,
     /// Whether the client has an open transaction.
     ///
     /// Tracked locally rather than asked of PostgreSQL, which would cost a
@@ -447,6 +513,7 @@ impl SessionPostgresExecutor {
         Self {
             connection_string,
             client: Mutex::new(None),
+            applied_schema: Mutex::new(None),
             in_transaction: AtomicBool::new(false),
         }
     }
@@ -454,7 +521,33 @@ impl SessionPostgresExecutor {
     fn note_transaction_statement(&self, sql: &str) {
         if let Some(open) = transaction_state_change(sql) {
             self.in_transaction.store(open, Ordering::Relaxed);
+            if !open {
+                // SET search_path is transactional, so a rollback undoes it.
+                if let Ok(mut applied) = self.applied_schema.try_lock() {
+                    *applied = None;
+                }
+            }
         }
+    }
+
+    /// Apply the session's schema, skipping the statement when it is unchanged.
+    async fn apply_schema(&self, client: &tokio_postgres::Client, schema: Option<&str>) -> Result<(), MiddlewareError> {
+        let wanted = schema.map(str::trim).filter(|s| !s.is_empty());
+        let mut applied = self.applied_schema.lock().await;
+        if applied.as_deref() == wanted {
+            return Ok(());
+        }
+        // A failure here must not become the caller's error. Inside an aborted
+        // transaction every statement fails, including this one, and reporting
+        // "failed to set schema" would replace the error that actually aborted
+        // the transaction - and would stop the client's ROLLBACK getting through,
+        // leaving it no way to recover.
+        if let Err(err) = Self::set_schema(client, wanted).await {
+            tracing::debug!("deferring schema change: {err}");
+            return Ok(());
+        }
+        *applied = wanted.map(ToOwned::to_owned);
+        Ok(())
     }
 
     /// Open a savepoint so a failed statement can be retried.
@@ -523,7 +616,15 @@ impl PostgresExecutor for SessionPostgresExecutor {
         self.note_transaction_statement(sql);
         let guard = self.acquire().await?;
         let client = guard.as_ref().unwrap();
-        Self::set_schema(client, schema).await?;
+        self.apply_schema(client, schema).await?;
+
+        // MySQL leaves a transaction usable after a failed statement; PostgreSQL
+        // aborts it, and every later statement then fails with 25P02. Clients
+        // rely on the MySQL behaviour - Knex, for one, attempts DDL it expects
+        // may fail and carries on - so each statement inside a transaction runs
+        // under a savepoint that is rolled back if it fails. Outside a
+        // transaction there is nothing to protect and no savepoint is taken.
+        let savepoint = self.begin_repair_savepoint(client).await;
 
         let sql_upper = sql.trim_start().to_uppercase();
         let returns_rows = sql_upper.starts_with("SELECT")
@@ -549,6 +650,7 @@ impl PostgresExecutor for SessionPostgresExecutor {
                 );
                 Ok(QueryResult {
                     columns: vec![],
+                    column_kinds: Vec::new(),
                     rows: vec![],
                     row_count,
                     last_insert_id,
@@ -568,6 +670,7 @@ impl PostgresExecutor for SessionPostgresExecutor {
                 );
                 Ok(QueryResult {
                     columns: vec![],
+                    column_kinds: Vec::new(),
                     rows: vec![],
                     row_count,
                     last_insert_id,
@@ -585,6 +688,7 @@ impl PostgresExecutor for SessionPostgresExecutor {
                     .sum();
                 Ok(QueryResult {
                     columns: vec![],
+                    column_kinds: Vec::new(),
                     rows: vec![],
                     row_count: affected,
                     last_insert_id: 0,
@@ -605,6 +709,11 @@ impl PostgresExecutor for SessionPostgresExecutor {
                 .iter()
                 .map(|column| column.name().to_string())
                 .collect::<Vec<_>>();
+            let column_kinds = statement
+                .columns()
+                .iter()
+                .map(|column| column_kind(column.type_()))
+                .collect::<Vec<_>>();
             let rendered_rows = rows
                 .iter()
                 .map(|row| {
@@ -619,11 +728,16 @@ impl PostgresExecutor for SessionPostgresExecutor {
             Ok(QueryResult {
                 row_count: rendered_rows.len() as u64,
                 columns,
+                column_kinds,
                 rows: rendered_rows,
                 last_insert_id: 0,
             })
         };
 
+        match &result {
+            Ok(_) => Self::release_repair_savepoint(client, savepoint).await,
+            Err(_) => Self::rollback_repair_savepoint(client, savepoint).await,
+        }
         result
     }
 
@@ -643,7 +757,7 @@ impl PostgresExecutor for SessionPostgresExecutor {
     ) -> Result<QueryResult, MiddlewareError> {
         let guard = self.acquire().await?;
         let client = guard.as_ref().unwrap();
-        Self::set_schema(client, schema).await?;
+        self.apply_schema(client, schema).await?;
 
         // Prepared statements get the same self-healing as the simple-query path:
         // a MySQL client can rely on behaviour PostgreSQL rejects outright, and the
@@ -700,7 +814,7 @@ impl PostgresExecutor for SessionPostgresExecutor {
     ) -> Result<Vec<String>, MiddlewareError> {
         let guard = self.acquire().await?;
         let client = guard.as_ref().unwrap();
-        Self::set_schema(client, schema).await?;
+        self.apply_schema(client, schema).await?;
 
         let messages = simple_query_with_compat_retry(&client, sql)
             .await
@@ -732,7 +846,7 @@ impl PostgresExecutor for SessionPostgresExecutor {
     ) -> Result<Vec<String>, MiddlewareError> {
         let guard = self.acquire().await?;
         let client = guard.as_ref().unwrap();
-        Self::set_schema(client, schema).await?;
+        self.apply_schema(client, schema).await?;
 
         let statement = prepare_with_compat_retry(&client, sql)
             .await
@@ -1422,6 +1536,7 @@ async fn execute_prepared_attempt(
             );
             Ok(QueryResult {
                 columns: Vec::new(),
+                column_kinds: Vec::new(),
                 rows: Vec::new(),
                 row_count,
                 last_insert_id,
@@ -1445,6 +1560,7 @@ async fn execute_prepared_attempt(
             );
             Ok(QueryResult {
                 columns: Vec::new(),
+                column_kinds: Vec::new(),
                 rows: Vec::new(),
                 row_count,
                 last_insert_id,
@@ -1456,6 +1572,7 @@ async fn execute_prepared_attempt(
                 .map_err(PreparedAttemptError::Db)?;
             Ok(QueryResult {
                 columns: Vec::new(),
+                column_kinds: Vec::new(),
                 rows: Vec::new(),
                 row_count: affected,
                 last_insert_id: 0,
@@ -1471,6 +1588,11 @@ async fn execute_prepared_attempt(
             .iter()
             .map(|column| column.name().to_string())
             .collect::<Vec<_>>();
+        let column_kinds = statement
+            .columns()
+            .iter()
+            .map(|column| column_kind(column.type_()))
+            .collect::<Vec<_>>();
         let rendered_rows = rows
             .iter()
             .map(|row| {
@@ -1485,6 +1607,7 @@ async fn execute_prepared_attempt(
         Ok(QueryResult {
             row_count: rendered_rows.len() as u64,
             columns,
+            column_kinds,
             rows: rendered_rows,
             last_insert_id: 0,
         })

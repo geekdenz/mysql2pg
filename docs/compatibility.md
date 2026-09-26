@@ -118,12 +118,34 @@ Two applications are carried end to end, plus a synthetic suite:
 | `examples/silverstripe/` | SilverStripe CMS on its MariaDB driver over **both PDO and mysqli**, on **both the 4.13 and 5.x lines**; `smoke.sh` builds the schema, drives the ORM, then reads the rows back with `psql` |
 | `examples/silverstripe/mysqli-probe.php` | raw mysqli against the middleware — text and binary protocol, `bind_result`, `store_result`, prepared `SHOW` |
 | `examples/bookstack/` | BookStack (Laravel/Eloquent, MySQL-only upstream): all 104 migrations, then the query builder through write/read/aggregate/join/subquery |
+| `examples/ghost/` | Ghost (Node/Knex/mysql2) — **incomplete**: boots and serves, but migration locking hits PostgreSQL's transaction-abort semantics. See its README |
 
 SilverStripe is a deliberately different shape from Matomo: a different ORM, a
 different quoting convention (`ANSI_QUOTES`), and heavy schema introspection.
 Its framework and PHP versions are build arguments rather than pins, so the
 proof is not tied to one release: 4.13 covers both client libraries because it
 is the last line shipping PDO, and 5.x covers the current line on mysqli.
+
+### Result column types
+
+Announcing every column as a string is safe for PHP, where `"0"` is falsy, and
+wrong for a client in a language where it is not: a Node client reading a
+boolean column got the string `"0"`, which is truthy in JavaScript, and read
+every such value backwards. Numeric columns are therefore announced with a
+numeric type and written as numbers.
+
+Temporal, decimal and binary columns are still announced as strings. They are
+carried as text, and the protocol writer requires a value whose Rust type
+matches the declared one, so announcing `DATETIME` without also encoding a date
+fails the connection. Numbers are the case that changes client behaviour.
+
+### The reported server version
+
+Applications gate features on the server version, and they do not agree on what
+they want: Matomo and SilverStripe expect MariaDB, Ghost refuses to run against
+it and requires MySQL 8. The reported version is configurable with
+`MW_MYSQL_SERVER_VERSION` (and `MW_MYSQL_SERVER_VERSION_COMMENT`), defaulting to
+MariaDB.
 
 ### Client libraries
 

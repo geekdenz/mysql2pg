@@ -22,7 +22,7 @@ use tokio::{io::split, net::TcpListener};
 use crate::{
     config::{AppConfig, TranslatorConfig},
     error::MiddlewareError,
-    executor::{PgParam, PostgresExecutor, QueryResult, SessionPostgresExecutor},
+    executor::{ColumnKind, PgParam, PostgresExecutor, QueryResult, SessionPostgresExecutor},
     parser::{parse_mysql_sql, parse_postgres_sql},
     translator::{translate_sql, TranslationResult},
 };
@@ -90,8 +90,31 @@ static KILLED_CONNECTION_IDS: LazyLock<Mutex<HashSet<u32>>> =
     LazyLock::new(|| Mutex::new(HashSet::new()));
 static DEFAULT_DATABASE_NAME: LazyLock<Mutex<Option<String>>> =
     LazyLock::new(|| Mutex::new(None));
-const MYSQL_COMPAT_VERSION: &str = "11.8.7-MariaDB-ubu2404";
-const MYSQL_COMPAT_VERSION_COMMENT: &str = "MariaDB Server";
+/// The server version reported to clients.
+///
+/// Applications gate features on this, and they do not all want the same answer:
+/// Matomo and SilverStripe expect MariaDB, while Ghost requires MySQL 8 and
+/// refuses to run against MariaDB at all. Overridable per deployment with
+/// MW_MYSQL_SERVER_VERSION.
+static MYSQL_COMPAT_VERSION: LazyLock<String> = LazyLock::new(|| {
+    std::env::var("MW_MYSQL_SERVER_VERSION")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| "11.8.7-MariaDB-ubu2404".to_string())
+});
+
+static MYSQL_COMPAT_VERSION_COMMENT: LazyLock<String> = LazyLock::new(|| {
+    std::env::var("MW_MYSQL_SERVER_VERSION_COMMENT")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| {
+            if MYSQL_COMPAT_VERSION.contains("MariaDB") {
+                "MariaDB Server".to_string()
+            } else {
+                "MySQL Community Server - GPL".to_string()
+            }
+        })
+});
 static PG_SQLSTATE_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\[([0-9A-Z]{5})\]").unwrap());
 
 /// Maps a PostgreSQL SQLSTATE (bracketed by `format_pg_error` in executor.rs, e.g.
@@ -113,6 +136,17 @@ fn mysql_error_kind_for_message(msg: &str) -> ErrorKind {
         "22001" => ErrorKind::ER_DATA_TOO_LONG,
         "40001" | "40P01" => ErrorKind::ER_LOCK_DEADLOCK,
         "57014" => ErrorKind::ER_QUERY_INTERRUPTED,
+        // DDL errors. Migration tools routinely attempt a statement and decide
+        // from the error code whether it was already applied, so these have to
+        // arrive as the code the client expects rather than a generic failure.
+        "42P16" if msg.to_ascii_lowercase().contains("primary key") => {
+            ErrorKind::ER_MULTIPLE_PRI_KEY
+        }
+        "42P07" => ErrorKind::ER_TABLE_EXISTS_ERROR,
+        "42701" => ErrorKind::ER_DUP_FIELDNAME,
+        "42P01" => ErrorKind::ER_NO_SUCH_TABLE,
+        "42703" => ErrorKind::ER_BAD_FIELD_ERROR,
+        "42704" => ErrorKind::ER_CANT_DROP_FIELD_OR_KEY,
         _ => ErrorKind::ER_UNKNOWN_ERROR,
     }
 }
@@ -195,7 +229,7 @@ where
     type Error = MySqlServerError;
 
     fn version(&self) -> String {
-        MYSQL_COMPAT_VERSION.to_string()
+        MYSQL_COMPAT_VERSION.clone()
     }
 
     fn connect_id(&self) -> u32 {
@@ -628,6 +662,7 @@ async fn execute_multi_statement_sql(
 
     Ok(QueryResult {
         columns: Vec::new(),
+        column_kinds: Vec::new(),
         rows: Vec::new(),
         row_count: total_row_count,
         last_insert_id: 0,
@@ -653,21 +688,45 @@ where
         return Ok(());
     }
 
+    // Report the real column type where it is known. A client in a language
+    // where "0" is truthy - JavaScript, unlike PHP - reads a boolean or integer
+    // column wrongly if everything is announced as a string.
     let columns = query_result
         .columns
         .iter()
-        .map(|name| make_string_column(name))
+        .enumerate()
+        .map(|(idx, name)| match query_result.column_kinds.get(idx) {
+            Some(kind) => make_column(name, mysql_column_type(*kind)),
+            None => make_string_column(name),
+        })
         .collect::<Vec<_>>();
 
     let mut writer = results.start(&columns).await?;
     for row in &query_result.rows {
-        // Values go out as bytes: a BLOB column may hold arbitrary binary that is not
-        // valid UTF-8, and the MySQL text protocol transmits it verbatim.
-        let row = row
-            .iter()
-            .map(|value| value.as_ref().map(|value| value.as_bytes().to_vec()))
-            .collect::<Vec<_>>();
-        writer.write_row(row).await?;
+        for (idx, value) in row.iter().enumerate() {
+            let Some(value) = value else {
+                writer.write_col(None::<&[u8]>)?;
+                continue;
+            };
+            // A value has to be written as the type its column was announced as;
+            // the protocol writer rejects a byte string for a numeric column.
+            // Everything else goes out as bytes, because a BLOB may hold binary
+            // that is not valid UTF-8 and the text protocol transmits it verbatim.
+            match query_result.column_kinds.get(idx) {
+                Some(ColumnKind::Tiny | ColumnKind::Int | ColumnKind::BigInt) => {
+                    match value.to_lossy_string().parse::<i64>() {
+                        Ok(number) => writer.write_col(number)?,
+                        Err(_) => writer.write_col(value.as_bytes())?,
+                    }
+                }
+                Some(ColumnKind::Double) => match value.to_lossy_string().parse::<f64>() {
+                    Ok(number) => writer.write_col(number)?,
+                    Err(_) => writer.write_col(value.as_bytes())?,
+                },
+                _ => writer.write_col(value.as_bytes())?,
+            }
+        }
+        writer.end_row().await?;
     }
     writer.finish().await?;
     Ok(())
@@ -691,11 +750,44 @@ where
 }
 
 fn make_string_column(name: &str) -> Column {
+    make_column(name, ColumnType::MYSQL_TYPE_VAR_STRING)
+}
+
+fn make_column(name: &str, coltype: ColumnType) -> Column {
     Column {
         table: "result".to_string(),
         column: name.to_string(),
-        coltype: ColumnType::MYSQL_TYPE_VAR_STRING,
+        coltype,
         colflags: ColumnFlags::empty(),
+    }
+}
+
+/// The MySQL column type to announce for a result column.
+///
+/// Values still go out as text, which is what MySQL's text protocol does: the
+/// client parses them according to the type declared here.
+fn mysql_column_type(kind: ColumnKind) -> ColumnType {
+    match kind {
+        // Every integer width is announced as LONGLONG: the protocol writer
+        // requires the value's Rust type to match the declared type exactly, and
+        // one integer type keeps that mapping unambiguous. Clients read it as a
+        // number either way, which is the point - a string "0" is truthy in
+        // JavaScript, a numeric 0 is not.
+        ColumnKind::Tiny | ColumnKind::Int | ColumnKind::BigInt => {
+            ColumnType::MYSQL_TYPE_LONGLONG
+        }
+        ColumnKind::Double => ColumnType::MYSQL_TYPE_DOUBLE,
+        // Temporal, decimal and binary columns stay strings. The protocol writer
+        // would demand a matching Rust value (a chrono date for DATETIME, for
+        // instance) and these are already carried as text; announcing a type
+        // without encoding to match it fails the connection. Numbers are the case
+        // that actually matters, because a string "0" is truthy in JavaScript.
+        ColumnKind::Decimal
+        | ColumnKind::DateTime
+        | ColumnKind::Date
+        | ColumnKind::Time
+        | ColumnKind::Blob
+        | ColumnKind::Text => ColumnType::MYSQL_TYPE_VAR_STRING,
     }
 }
 
@@ -857,19 +949,19 @@ fn canned_response_for_query(query: &str) -> Option<(Vec<String>, Vec<Vec<String
     if normalized.eq_ignore_ascii_case("SELECT VERSION()") {
         return Some((
             vec!["VERSION()".to_string()],
-            vec![vec![MYSQL_COMPAT_VERSION.to_string()]],
+            vec![vec![MYSQL_COMPAT_VERSION.clone()]],
         ));
     }
     if normalized.eq_ignore_ascii_case("SELECT @@VERSION") {
         return Some((
             vec!["@@VERSION".to_string()],
-            vec![vec![MYSQL_COMPAT_VERSION.to_string()]],
+            vec![vec![MYSQL_COMPAT_VERSION.clone()]],
         ));
     }
     if normalized.eq_ignore_ascii_case("SELECT @@VERSION_COMMENT") {
         return Some((
             vec!["@@VERSION_COMMENT".to_string()],
-            vec![vec![MYSQL_COMPAT_VERSION_COMMENT.to_string()]],
+            vec![vec![MYSQL_COMPAT_VERSION_COMMENT.clone()]],
         ));
     }
     if normalized.eq_ignore_ascii_case("SELECT @@SESSION.SQL_MODE")
@@ -972,8 +1064,8 @@ fn dynamic_canned_response_for_system_variable_select(
         "sql_mode" => session_sql_mode.to_string(),
         "collation_connection" => session_collation.to_string(),
         "transaction_isolation" | "tx_isolation" => transaction_isolation.to_string(),
-        "version" => MYSQL_COMPAT_VERSION.to_string(),
-        "version_comment" => MYSQL_COMPAT_VERSION_COMMENT.to_string(),
+        "version" => MYSQL_COMPAT_VERSION.clone(),
+        "version_comment" => MYSQL_COMPAT_VERSION_COMMENT.clone(),
         _ => return None,
     };
 
@@ -1989,5 +2081,75 @@ mod tests {
         );
         assert!(collation_matches_charset("utf8", "utf8_general_ci"));
         assert!(collation_matches_charset("utf8mb4", "utf8mb4_general_ci"));
+    }
+}
+
+#[cfg(test)]
+mod ddl_error_mapping_tests {
+    use super::*;
+
+    #[test]
+    fn ddl_sqlstates_map_to_the_codes_clients_expect() {
+        // Migration tools branch on these to decide "already applied".
+        assert_eq!(
+            mysql_error_kind_for_message("[42P16] multiple primary keys for table \"t\" are not allowed"),
+            ErrorKind::ER_MULTIPLE_PRI_KEY
+        );
+        assert_eq!(
+            mysql_error_kind_for_message("[42P07] relation \"t\" already exists"),
+            ErrorKind::ER_TABLE_EXISTS_ERROR
+        );
+        assert_eq!(
+            mysql_error_kind_for_message("[42701] column \"c\" already exists"),
+            ErrorKind::ER_DUP_FIELDNAME
+        );
+        assert_eq!(
+            mysql_error_kind_for_message("[42P01] relation \"t\" does not exist"),
+            ErrorKind::ER_NO_SUCH_TABLE
+        );
+        assert_eq!(
+            mysql_error_kind_for_message("[42703] column \"c\" does not exist"),
+            ErrorKind::ER_BAD_FIELD_ERROR
+        );
+    }
+
+    #[test]
+    fn other_invalid_table_definitions_stay_generic() {
+        // 42P16 covers more than duplicate primary keys.
+        assert_eq!(
+            mysql_error_kind_for_message("[42P16] cannot use column reference in DEFAULT expression"),
+            ErrorKind::ER_UNKNOWN_ERROR
+        );
+    }
+}
+
+#[cfg(test)]
+mod column_type_tests {
+    use super::*;
+
+    #[test]
+    fn numeric_columns_are_announced_as_numbers() {
+        // The point of announcing a type at all: a client in a language where
+        // "0" is truthy must receive a number, not a string.
+        assert_eq!(mysql_column_type(ColumnKind::Tiny), ColumnType::MYSQL_TYPE_LONGLONG);
+        assert_eq!(mysql_column_type(ColumnKind::Int), ColumnType::MYSQL_TYPE_LONGLONG);
+        assert_eq!(mysql_column_type(ColumnKind::BigInt), ColumnType::MYSQL_TYPE_LONGLONG);
+        assert_eq!(mysql_column_type(ColumnKind::Double), ColumnType::MYSQL_TYPE_DOUBLE);
+    }
+
+    #[test]
+    fn everything_else_stays_a_string() {
+        // These are carried as text, and announcing a type the writer cannot
+        // match would fail the connection.
+        for kind in [
+            ColumnKind::Decimal,
+            ColumnKind::DateTime,
+            ColumnKind::Date,
+            ColumnKind::Time,
+            ColumnKind::Blob,
+            ColumnKind::Text,
+        ] {
+            assert_eq!(mysql_column_type(kind), ColumnType::MYSQL_TYPE_VAR_STRING);
+        }
     }
 }
