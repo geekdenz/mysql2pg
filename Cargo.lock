@@ -1234,7 +1234,7 @@ dependencies = [
 
 [[package]]
 name = "mysql2pg-middleware"
-version = "0.0.5"
+version = "0.0.6"
 dependencies = [
  "anyhow",
  "async-trait",
